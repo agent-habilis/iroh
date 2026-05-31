@@ -185,8 +185,12 @@ impl RemoteMap {
             match result {
                 Ok((eid, leftover_msgs)) => {
                     if leftover_msgs.is_empty() {
-                        // the actor shut down cleanly
+                        // the actor shut down cleanly — also evict the cached
+                        // mapped addrs so they don't accumulate per remote ever
+                        // seen (n0-computer/iroh#4294).
                         self.senders.remove(&eid);
+                        self.mapped_addrs.endpoint_addrs.remove(&eid);
+                        self.mapped_addrs.relay_addrs.retain(|key, _| key.1 != eid);
                         return Poll::Ready(eid);
                     }
 
