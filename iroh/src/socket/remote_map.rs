@@ -234,8 +234,14 @@ impl RemoteMap {
         leftover_msgs: Vec<RemoteStateMessage>,
     ) -> bool {
         if leftover_msgs.is_empty() {
-            // the actor shut down cleanly
+            // the actor shut down cleanly — also evict the cached mapped addrs
+            // so they don't accumulate per remote ever seen
+            // (n0-computer/iroh#4294).
             self.senders.remove(&remote_id);
+            self.mapped_addrs.endpoint_addrs.remove(&remote_id);
+            self.mapped_addrs
+                .relay_addrs
+                .retain(|key, _| key.1 != remote_id);
             trace!(%remote_id, "cleaned up RemoteStateActor");
             true
         } else {
