@@ -432,7 +432,7 @@ impl RemoteStateActor {
             })
             .into_mut();
 
-        // fofoca patch (Initial fan-out, part 3): the mirror case of the
+        // habilis-network patch (Initial fan-out, part 3): the mirror case of the
         // learn-time hook — this connection may have been created *after* a
         // custom-transport address was learned, and born on the relay path
         // that won the handshake race. Queue the book's custom addresses so
@@ -820,7 +820,7 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        // fofoca patch (Initial fan-out): Initials always fan out to every
+        // habilis-network patch (Initial fan-out): Initials always fan out to every
         // known path, even when a path is already selected. The selected-only
         // fast path starved custom-transport paths permanently: signalling
         // over the relay leaves the relay *selected* for the remote, a later
@@ -876,7 +876,7 @@ impl State {
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
         let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).collect();
-        // fofoca patch (Initial fan-out, part 3): see `schedule_open_custom_paths`.
+        // habilis-network patch (Initial fan-out, part 3): see `schedule_open_custom_paths`.
         self.schedule_open_custom_paths(addrs.iter());
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
@@ -892,7 +892,7 @@ impl State {
         if self.address_lookup_stream.is_some() {
             return;
         }
-        // fofoca patch (Initial fan-out, part 2): a *relay*-selected path
+        // habilis-network patch (Initial fan-out, part 2): a *relay*-selected path
         // must not suppress Address Lookup. Signalling over the relay leaves
         // the relay selected for the remote; skipping the lookup then means
         // an address registered later — a custom-transport address for a
@@ -954,7 +954,7 @@ impl State {
                     let addrs: Vec<_> =
                         to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
                             .collect();
-                    // fofoca patch (Initial fan-out, part 3): see
+                    // habilis-network patch (Initial fan-out, part 3): see
                     // `schedule_open_custom_paths`.
                     self.schedule_open_custom_paths(addrs.iter());
                     self.paths.insert_multiple(addrs.into_iter(), source);
@@ -1112,7 +1112,7 @@ impl State {
         }
     }
 
-    /// fofoca patch (Initial fan-out, part 3): queue newly learned
+    /// habilis-network patch (Initial fan-out, part 3): queue newly learned
     /// custom-transport addresses for opening on every live connection.
     ///
     /// Paths are only ever opened on a live connection for the *selected*

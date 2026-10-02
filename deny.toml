@@ -29,5 +29,5 @@ ignore = [
 
 [sources]
 allow-git = [
-  "https://github.com/fofoca-network/net-tools", # netwatch + portmapper fork pin
+  "https://github.com/agent-habilis/net-tools", # netwatch + portmapper fork pin
 ]

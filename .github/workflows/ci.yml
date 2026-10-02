@@ -529,8 +529,8 @@ jobs:
 
   netsim-integration-tests:
     permissions: write-all
-    # netsim needs n0's runner setup (chuck, mininet), which the fofoca fork does not have.
-    if: "github.repository_owner != 'fofoca-network' && (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))"
+    # netsim needs n0's runner setup (chuck, mininet), which the habilis-network fork does not have.
+    if: "github.repository_owner != 'agent-habilis' && (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))"
     uses: "./.github/workflows/netsim_runner.yaml"
     secrets: inherit
     with:
