@@ -82,15 +82,32 @@ impl Preset for Arc<TestTransport> {
 /// let transport2 = network.create_transport(endpoint_id2)?;
 /// // transport1 and transport2 can now communicate via the network
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TestNetwork {
     inner: Arc<Mutex<TestNetworkInner>>,
+    transport_id: u64,
+}
+
+impl Default for TestNetwork {
+    fn default() -> Self {
+        Self::with_transport_id(TEST_TRANSPORT_ID)
+    }
 }
 
 impl TestNetwork {
     /// Creates a new empty test network.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new empty test network whose transport uses `transport_id`.
+    ///
+    /// Two endpoints can use two networks with different IDs to have two custom transports.
+    pub fn with_transport_id(transport_id: u64) -> Self {
+        Self {
+            inner: Default::default(),
+            transport_id,
+        }
     }
 
     /// Creates an address lookup service for this network.
@@ -104,7 +121,7 @@ impl TestNetwork {
     ///
     /// Returns an error if the ID already exists in the network.
     pub fn create_transport(&self, id: EndpointId) -> io::Result<Arc<TestTransport>> {
-        let id_custom = to_custom_addr(id);
+        let id_custom = custom_addr(self.transport_id, id);
         let mut guard = self.inner.lock().expect("poisoned");
         if guard.channels.contains_key(&id) {
             return Err(io::Error::other("endpoint ID already exists in network"));
@@ -148,7 +165,7 @@ impl AddressLookup for TestAddrLookup {
                 EndpointInfo {
                     endpoint_id,
                     data: EndpointData::from_iter([TransportAddr::Custom(CustomAddr::from_parts(
-                        TEST_TRANSPORT_ID,
+                        self.network.transport_id,
                         endpoint_id.as_bytes(),
                     ))]),
                 },
@@ -169,11 +186,15 @@ struct TestSender {
 
 /// Converts an endpoint ID to a custom address for this test transport.
 pub fn to_custom_addr(endpoint: EndpointId) -> CustomAddr {
-    CustomAddr::from((TEST_TRANSPORT_ID, &endpoint.as_bytes()[..]))
+    custom_addr(TEST_TRANSPORT_ID, endpoint)
 }
 
-fn try_parse_custom_addr(addr: &CustomAddr) -> io::Result<EndpointId> {
-    if addr.id() != TEST_TRANSPORT_ID {
+fn custom_addr(transport_id: u64, endpoint: EndpointId) -> CustomAddr {
+    CustomAddr::from((transport_id, &endpoint.as_bytes()[..]))
+}
+
+fn try_parse_custom_addr(transport_id: u64, addr: &CustomAddr) -> io::Result<EndpointId> {
+    if addr.id() != transport_id {
         return Err(io::Error::other("unexpected transport id"));
     }
     let key_bytes: &[u8; 32] = addr
@@ -185,7 +206,7 @@ fn try_parse_custom_addr(addr: &CustomAddr) -> io::Result<EndpointId> {
 
 impl TestSender {
     fn send_sync(&self, dst: &CustomAddr, packets: Vec<Packet>) -> io::Result<()> {
-        let to_id = try_parse_custom_addr(dst)?;
+        let to_id = try_parse_custom_addr(self.network.transport_id, dst)?;
         let guard = self.network.inner.lock().expect("poisoned");
         let (s, _) = guard
             .channels
@@ -213,7 +234,7 @@ impl TestSender {
     }
 
     fn split(&self, transmit: &Transmit) -> impl Iterator<Item = Packet> {
-        let from = to_custom_addr(self.id);
+        let from = custom_addr(self.network.transport_id, self.id);
         let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
         transmit
             .contents
@@ -227,7 +248,7 @@ impl TestSender {
 
 impl CustomSender for TestSender {
     fn is_valid_send_addr(&self, addr: &CustomAddr) -> bool {
-        addr.id() == TEST_TRANSPORT_ID
+        addr.id() == self.network.transport_id
     }
 
     fn poll_send(
@@ -296,7 +317,8 @@ impl CustomEndpoint for TestTransport {
             if buf.len() < packet.data.len() {
                 break;
             }
-            let from = try_parse_custom_addr(&packet.from).expect("valid custom addr");
+            let from = try_parse_custom_addr(self.network.transport_id, &packet.from)
+                .expect("valid custom addr");
             info!(
                 "recv {} -> {}: copying {} bytes",
                 from.fmt_short(),
@@ -304,7 +326,10 @@ impl CustomEndpoint for TestTransport {
                 packet.data.len()
             );
             buf[..packet.data.len()].copy_from_slice(&packet.data);
-            *recv_info = RecvInfo::new(packet.from, Some(to_custom_addr(self.id)));
+            *recv_info = RecvInfo::new(
+                packet.from,
+                Some(custom_addr(self.network.transport_id, self.id)),
+            );
             meta.len = packet.data.len();
             meta.stride = packet.data.len();
             count += 1;
@@ -737,6 +762,86 @@ mod tests {
         );
 
         verify_echo(&conn, b"custom wins over relay").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// A connection selected on a low-bias custom transport must open and select the
+    /// high-bias custom transport once its address is learned later.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_high_bias_custom_transport_wins_over_selected_custom() -> Result<()> {
+        const LOW_ID: u64 = TEST_TRANSPORT_ID;
+        const HIGH_ID: u64 = TEST_TRANSPORT_ID + 1;
+
+        let low_network = TestNetwork::with_transport_id(LOW_ID);
+        let high_network = TestNetwork::with_transport_id(HIGH_ID);
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+
+        let build = |secret_key: SecretKey| {
+            let low = low_network.create_transport(secret_key.public())?;
+            let high = high_network.create_transport(secret_key.public())?;
+            let selector = BiasedRttPathSelector::default().with_bias(
+                AddrKind::Custom(HIGH_ID),
+                TransportBias::primary().with_rtt_advantage(Duration::from_secs(10)),
+            );
+            n0_error::Ok(
+                Endpoint::builder(presets::N0)
+                    .secret_key(secret_key)
+                    .relay_mode(RelayMode::Disabled)
+                    .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
+                    .add_custom_transport(low)
+                    .add_custom_transport(high)
+                    .path_selector(Arc::new(selector))
+                    .clear_ip_transports(),
+            )
+        };
+        let ep1 = build(s1)?.bind().await?;
+        let ep2 = build(s2.clone())?.bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let id2 = s2.public();
+        let low_addr = TransportAddr::Custom(custom_addr(LOW_ID, id2));
+        let high_addr = TransportAddr::Custom(custom_addr(HIGH_ID, id2));
+        let is_selected = |conn: &Connection, id: u64| {
+            conn.paths().iter().any(|p| {
+                p.is_selected()
+                    && matches!(p.remote_addr(), TransportAddr::Custom(a) if a.id() == id)
+            })
+        };
+
+        let conn = ep1
+            .connect(EndpointAddr::from_parts(id2, [low_addr.clone()]), ECHO_ALPN)
+            .await?;
+        assert!(
+            is_selected(&conn, LOW_ID),
+            "low-bias path is selected first"
+        );
+
+        // The high-bias address is learned after the connection is selected on the low one.
+        // Resolve it without a new connection, because a new connection runs the selector.
+        ep1.inner()
+            .anyerr()?
+            .resolve_remote(EndpointAddr::from_parts(id2, [low_addr, high_addr]))
+            .await
+            .anyerr()?
+            .anyerr()?;
+
+        let promoted = tokio::time::timeout(Duration::from_secs(5), async {
+            while !is_selected(&conn, HIGH_ID) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            promoted.is_ok(),
+            "high-bias custom path must become selected, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"late high bias").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())

@@ -1127,8 +1127,9 @@ impl State {
     ///
     /// Custom addresses only: IP addresses have the whole holepunching
     /// machinery, and relay addresses are re-added on `AddConnection`.
-    /// Skipped when a non-relay path is already selected — the pair already
-    /// has a better-than-relay path, mirroring `trigger_address_lookup`.
+    /// Skipped when an IP path is already selected — holepunching handles the
+    /// pair from there. A selected custom path does not skip: another custom
+    /// transport can rank above it, and only an open path lets the selector see it.
     fn schedule_open_custom_paths<'a>(
         &mut self,
         addrs: impl Iterator<Item = &'a transports::Addr>,
@@ -1136,7 +1137,7 @@ impl State {
         if self
             .selected_path
             .as_ref()
-            .is_some_and(|selected| !selected.remote().is_relay())
+            .is_some_and(|selected| selected.is_ip())
         {
             return;
         }
