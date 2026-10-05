@@ -767,70 +767,96 @@ mod tests {
         Ok(())
     }
 
+    const LOW_ID: u64 = TEST_TRANSPORT_ID;
+    const HIGH_ID: u64 = TEST_TRANSPORT_ID + 1;
+
+    /// Two endpoints that each have two custom transports.
+    ///
+    /// The transport with `HIGH_ID` has a 10 s RTT advantage over the one with `LOW_ID`.
+    struct TwoCustom {
+        ep1: Endpoint,
+        router: Router,
+        id2: EndpointId,
+    }
+
+    impl TwoCustom {
+        async fn new() -> Result<Self> {
+            let low_network = TestNetwork::with_transport_id(LOW_ID);
+            let high_network = TestNetwork::with_transport_id(HIGH_ID);
+            let build = |secret_key: SecretKey| {
+                let low = low_network.create_transport(secret_key.public())?;
+                let high = high_network.create_transport(secret_key.public())?;
+                let selector = BiasedRttPathSelector::default().with_bias(
+                    AddrKind::Custom(HIGH_ID),
+                    TransportBias::primary().with_rtt_advantage(Duration::from_secs(10)),
+                );
+                n0_error::Ok(
+                    Endpoint::builder(presets::N0)
+                        .secret_key(secret_key)
+                        .relay_mode(RelayMode::Disabled)
+                        .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
+                        .add_custom_transport(low)
+                        .add_custom_transport(high)
+                        .path_selector(Arc::new(selector))
+                        .clear_ip_transports(),
+                )
+            };
+            let s2 = SecretKey::generate();
+            let ep1 = build(SecretKey::generate())?.bind().await?;
+            let ep2 = build(s2.clone())?.bind().await?;
+            let router = Router::builder(ep2).accept(ECHO_ALPN, Echo).spawn();
+            Ok(Self {
+                ep1,
+                router,
+                id2: s2.public(),
+            })
+        }
+
+        fn addr(&self, transport_ids: &[u64]) -> EndpointAddr {
+            EndpointAddr::from_parts(
+                self.id2,
+                transport_ids
+                    .iter()
+                    .map(|id| TransportAddr::Custom(custom_addr(*id, self.id2))),
+            )
+        }
+
+        /// Learns the addresses without opening a connection, because a new connection
+        /// runs the path selector and would hide a missing path.
+        async fn learn(&self, transport_ids: &[u64]) -> Result<()> {
+            self.ep1
+                .inner()
+                .anyerr()?
+                .resolve_remote(self.addr(transport_ids))
+                .await
+                .anyerr()?
+                .anyerr()?;
+            Ok(())
+        }
+    }
+
+    fn is_custom_id_selected(conn: &Connection, id: u64) -> bool {
+        conn.paths().iter().any(|p| {
+            p.is_selected() && matches!(p.remote_addr(), TransportAddr::Custom(a) if a.id() == id)
+        })
+    }
+
     /// A connection selected on a low-bias custom transport must open and select the
     /// high-bias custom transport once its address is learned later.
     #[tokio::test]
     #[traced_test]
     async fn test_late_high_bias_custom_transport_wins_over_selected_custom() -> Result<()> {
-        const LOW_ID: u64 = TEST_TRANSPORT_ID;
-        const HIGH_ID: u64 = TEST_TRANSPORT_ID + 1;
-
-        let low_network = TestNetwork::with_transport_id(LOW_ID);
-        let high_network = TestNetwork::with_transport_id(HIGH_ID);
-        let s1 = SecretKey::generate();
-        let s2 = SecretKey::generate();
-
-        let build = |secret_key: SecretKey| {
-            let low = low_network.create_transport(secret_key.public())?;
-            let high = high_network.create_transport(secret_key.public())?;
-            let selector = BiasedRttPathSelector::default().with_bias(
-                AddrKind::Custom(HIGH_ID),
-                TransportBias::primary().with_rtt_advantage(Duration::from_secs(10)),
-            );
-            n0_error::Ok(
-                Endpoint::builder(presets::N0)
-                    .secret_key(secret_key)
-                    .relay_mode(RelayMode::Disabled)
-                    .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
-                    .add_custom_transport(low)
-                    .add_custom_transport(high)
-                    .path_selector(Arc::new(selector))
-                    .clear_ip_transports(),
-            )
-        };
-        let ep1 = build(s1)?.bind().await?;
-        let ep2 = build(s2.clone())?.bind().await?;
-        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
-
-        let id2 = s2.public();
-        let low_addr = TransportAddr::Custom(custom_addr(LOW_ID, id2));
-        let high_addr = TransportAddr::Custom(custom_addr(HIGH_ID, id2));
-        let is_selected = |conn: &Connection, id: u64| {
-            conn.paths().iter().any(|p| {
-                p.is_selected()
-                    && matches!(p.remote_addr(), TransportAddr::Custom(a) if a.id() == id)
-            })
-        };
-
-        let conn = ep1
-            .connect(EndpointAddr::from_parts(id2, [low_addr.clone()]), ECHO_ALPN)
-            .await?;
+        let t = TwoCustom::new().await?;
+        let conn = t.ep1.connect(t.addr(&[LOW_ID]), ECHO_ALPN).await?;
         assert!(
-            is_selected(&conn, LOW_ID),
+            is_custom_id_selected(&conn, LOW_ID),
             "low-bias path is selected first"
         );
 
-        // The high-bias address is learned after the connection is selected on the low one.
-        // Resolve it without a new connection, because a new connection runs the selector.
-        ep1.inner()
-            .anyerr()?
-            .resolve_remote(EndpointAddr::from_parts(id2, [low_addr, high_addr]))
-            .await
-            .anyerr()?
-            .anyerr()?;
+        t.learn(&[LOW_ID, HIGH_ID]).await?;
 
         let promoted = tokio::time::timeout(Duration::from_secs(5), async {
-            while !is_selected(&conn, HIGH_ID) {
+            while !is_custom_id_selected(&conn, HIGH_ID) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
@@ -842,6 +868,91 @@ mod tests {
         );
 
         verify_echo(&conn, b"late high bias").await?;
+        conn.close(0u32.into(), b"done");
+        t.router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// A late low-bias address must not displace the selected high-bias path.
+    /// The cost is a backup path on the low-bias transport.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_low_bias_custom_transport_stays_backup() -> Result<()> {
+        let t = TwoCustom::new().await?;
+        let conn = t.ep1.connect(t.addr(&[HIGH_ID]), ECHO_ALPN).await?;
+        assert!(
+            is_custom_id_selected(&conn, HIGH_ID),
+            "high-bias path is selected first"
+        );
+
+        t.learn(&[LOW_ID, HIGH_ID]).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(
+            is_custom_id_selected(&conn, HIGH_ID),
+            "high-bias path stays selected, paths: {:?}",
+            conn.paths()
+        );
+        assert_eq!(
+            conn.paths().len(),
+            2,
+            "the low-bias path is open as a backup, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"low bias is backup").await?;
+        conn.close(0u32.into(), b"done");
+        t.router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// A custom address learned while an IP path is selected must not open a path:
+    /// holepunching handles that pair.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_custom_address_not_opened_while_ip_selected() -> Result<()> {
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        // Strong RTT disadvantage for custom transport
+        let custom_bias = TransportBias::primary().with_rtt_disadvantage(Duration::from_secs(10));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_custom_bias(custom_bias);
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ip_only = EndpointAddr::from_parts(
+            s2.public(),
+            ep2.addr().addrs.iter().filter(|a| a.is_ip()).cloned(),
+        );
+        let conn = ep1.connect(ip_only, ECHO_ALPN).await?;
+        assert!(
+            conn.paths()
+                .iter()
+                .any(|p| p.is_selected() && p.remote_addr().is_ip()),
+            "IP path is selected first"
+        );
+
+        ep1.inner()
+            .anyerr()?
+            .resolve_remote(mixed_addr(&ep2, s2.public()))
+            .await
+            .anyerr()?
+            .anyerr()?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(
+            !conn.paths().iter().any(|p| p.remote_addr().is_custom()),
+            "no custom path is opened while IP is selected, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"ip stays").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
