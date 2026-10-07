@@ -682,6 +682,10 @@ impl RemoteStateActor {
             && self.state.selected_path.as_ref() != Some(&addr)
         {
             let prev_remote = self.state.selected_path.replace(addr.clone());
+            if left_ip(prev_remote.as_ref(), &addr) {
+                let known: Vec<transports::Addr> = self.state.paths.addrs().cloned().collect();
+                self.state.schedule_open_custom_paths(known.iter());
+            }
             event!(
                 target: "iroh::_events::path::selected",
                 Level::DEBUG,
@@ -1627,6 +1631,15 @@ fn queue_open_retry(
     }
 }
 
+/// Whether the selected path moved off an IP path to another kind.
+///
+/// `schedule_open_custom_paths` skips a pair whose selected path is IP, so a custom
+/// address learned meanwhile is queued by nobody. When the IP path goes away, the
+/// pair is pinned to its relay path unless the learned addresses are queued again.
+fn left_ip(prev: Option<&transports::FourTuple>, now: &transports::FourTuple) -> bool {
+    prev.is_some_and(|prev| prev.is_ip()) && !now.is_ip()
+}
+
 /// Returns the next item if `maybe_stream` is `Some`, or `None` otherwise.
 async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<Option<S::Item>> {
     match maybe_stream {
@@ -1651,6 +1664,24 @@ mod tests {
                 queue_open_retry(queue, &addr);
             }
         }
+    }
+
+    // A pair on an IP path queues no learned custom address. The addresses must be queued
+    // when the pair leaves that path, or its connection stays on the relay for good.
+    #[test]
+    fn leaving_an_ip_path_is_told_from_moving_between_other_paths() {
+        let ip = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            4000,
+        ))));
+        let relay = transports::FourTuple::from_remote(transports::Addr::Relay(
+            "http://127.0.0.1:1".parse().expect("a relay url"),
+            iroh_base::SecretKey::from_bytes(&[7; 32]).public(),
+        ));
+        assert!(left_ip(Some(&ip), &relay), "IP to relay");
+        assert!(!left_ip(None, &relay), "nothing before");
+        assert!(!left_ip(Some(&relay), &ip), "relay to IP");
+        assert!(!left_ip(Some(&relay), &relay), "no move");
     }
 
     // A connection with no free path id queues the address for a later attempt. The

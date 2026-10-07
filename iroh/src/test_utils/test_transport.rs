@@ -957,4 +957,116 @@ mod tests {
         router.shutdown().await.anyerr()?;
         Ok(())
     }
+
+    /// Prefers IP while `ip_usable` is set. Once it is cleared, it prefers a custom
+    /// path over the relay, as `BiasedRttPathSelector` does by default.
+    #[derive(Debug)]
+    struct IpUntilCut {
+        ip_usable: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::socket::remote_map::PathSelector for IpUntilCut {
+        fn select(
+            &self,
+            ctx: &crate::socket::remote_map::PathSelectionContext<'_>,
+        ) -> crate::socket::remote_map::PathSelection {
+            let ip_usable = self.ip_usable.load(std::sync::atomic::Ordering::SeqCst);
+            let rank = |path: &crate::socket::remote_map::PathSelectionData<'_>| {
+                let tuple = path.network_path();
+                if tuple.is_ip() {
+                    if ip_usable { Some(0) } else { None }
+                } else if matches!(tuple.remote(), crate::socket::transports::Addr::Custom(_)) {
+                    Some(1)
+                } else {
+                    Some(2)
+                }
+            };
+            let best = ctx
+                .paths()
+                .filter_map(|path| rank(&path).map(|rank| (rank, path)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, path)| path);
+            let mut selection = crate::socket::remote_map::PathSelection::none();
+            if let Some(path) = best {
+                selection.set(&path);
+            }
+            selection
+        }
+    }
+
+    /// A custom address learned while an IP path is selected opens no path. When the
+    /// IP path stops being usable and the relay is selected, the custom address must
+    /// open then, or the pair stays on the relay for as long as it lives.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_custom_address_opens_when_ip_is_lost() -> Result<()> {
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        let ip_usable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_relay(relay_map.clone());
+        let ep1 = endpoint_builder(s1, t1, config.clone())
+            .path_selector(Arc::new(IpUntilCut {
+                ip_usable: ip_usable.clone(),
+            }))
+            .bind()
+            .await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        ep1.online().await;
+        ep2.online().await;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ip_and_relay = EndpointAddr::from_parts(
+            s2.public(),
+            ep2.addr().addrs.iter().filter(|a| !a.is_custom()).cloned(),
+        );
+        let conn = ep1.connect(ip_and_relay, ECHO_ALPN).await?;
+        assert!(
+            conn.paths()
+                .iter()
+                .any(|p| p.is_selected() && p.remote_addr().is_ip()),
+            "IP path is selected first"
+        );
+
+        ep1.inner()
+            .anyerr()?
+            .resolve_remote(mixed_addr(&ep2, s2.public()))
+            .await
+            .anyerr()?
+            .anyerr()?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !conn.paths().iter().any(|p| p.remote_addr().is_custom()),
+            "no custom path is opened while IP is selected, paths: {:?}",
+            conn.paths()
+        );
+
+        // The IP path stops being usable: the selector moves to the relay, and the
+        // network change makes it run.
+        ip_usable.store(false, std::sync::atomic::Ordering::SeqCst);
+        ep1.network_change().await;
+
+        let opened = tokio::time::timeout(Duration::from_secs(10), async {
+            while !is_custom_selected(&conn) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            opened.is_ok(),
+            "the custom path opens once IP is lost, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"custom after ip").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
 }
