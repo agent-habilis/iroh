@@ -1636,6 +1636,10 @@ fn queue_open_retry(
 /// `schedule_open_custom_paths` skips a pair whose selected path is IP, so a custom
 /// address learned meanwhile is queued by nobody. When the IP path goes away, the
 /// pair is pinned to its relay path unless the learned addresses are queued again.
+///
+/// Cost: once a pair has left IP, its custom path stays open on every connection of the
+/// pair, also after IP returns. Each custom address keeps one more path id and its
+/// keep-alive for as long as the connections live.
 fn left_ip(prev: Option<&transports::FourTuple>, now: &transports::FourTuple) -> bool {
     prev.is_some_and(|prev| prev.is_ip()) && !now.is_ip()
 }
