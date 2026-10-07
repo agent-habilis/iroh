@@ -1103,7 +1103,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        queue_open_retry(&mut self.pending_open_paths, open_addr);
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1612,10 +1612,64 @@ fn to_transports_addr(
     })
 }
 
+/// Queues `open_addr` to be opened again on the next scheduled attempt, unless it is queued.
+///
+/// The attempt opens each queued address on every connection of the remote, and each
+/// connection that still has no free path id queues the address again. A queued copy
+/// is enough: without this check the queue grows by the number of connections at every
+/// attempt, and a remote with a few such connections takes gigabytes in seconds.
+fn queue_open_retry(
+    queue: &mut VecDeque<transports::FourTuple>,
+    open_addr: &transports::FourTuple,
+) {
+    if !queue.contains(open_addr) {
+        queue.push_back(open_addr.clone());
+    }
+}
+
 /// Returns the next item if `maybe_stream` is `Some`, or `None` otherwise.
 async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<Option<S::Item>> {
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::*;
+
+    /// Replays the timer that retries the queue: it takes every queued address and
+    /// opens it on every connection of the remote. A connection that still has no free
+    /// path id queues the address again.
+    fn drain_pass(queue: &mut VecDeque<transports::FourTuple>, conns: usize) {
+        let mut taken = std::mem::take(queue);
+        while let Some(addr) = taken.pop_front() {
+            for _ in 0..conns {
+                queue_open_retry(queue, &addr);
+            }
+        }
+    }
+
+    // A connection with no free path id queues the address for a later attempt. The
+    // timer opens the queued addresses on all connections of the remote, and each one
+    // that is still exhausted queues the address again. Without a check for a copy, the
+    // queue grows by the number of connections at every pass, without bound.
+    #[test]
+    fn exhausted_connections_do_not_grow_the_retry_queue() {
+        let addr = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            4000,
+        ))));
+        let mut queue = VecDeque::new();
+        queue_open_retry(&mut queue, &addr);
+
+        for _ in 0..5 {
+            drain_pass(&mut queue, 3);
+        }
+
+        assert_eq!(queue.len(), 1, "one address queued, once");
     }
 }
