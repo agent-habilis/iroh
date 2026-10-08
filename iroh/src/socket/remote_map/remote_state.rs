@@ -1384,7 +1384,7 @@ pub struct PathSelectionContext<'a> {
 #[derive(Debug)]
 enum PathsSource<'a> {
     Live(&'a FxHashMap<ConnId, ConnectionState>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selector-test-utils"))]
     Test(Vec<PathSelectionData<'a>>),
 }
 
@@ -1401,8 +1401,8 @@ impl<'a> PathSelectionContext<'a> {
     }
 
     /// Constructs a context with synthetic path data for testing.
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "selector-test-utils"))]
+    pub fn for_test(
         current: Option<&'a transports::FourTuple>,
         paths: Vec<PathSelectionData<'a>>,
     ) -> Self {
@@ -1433,7 +1433,7 @@ impl<'a> PathSelectionContext<'a> {
                         })
                     }),
             ),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "selector-test-utils"))]
             PathsSource::Test(paths) => Box::new(paths.iter().cloned()),
         }
     }
@@ -1460,7 +1460,7 @@ enum StatsSource {
     },
     /// Boxed so `PathStats` (100+ bytes, 14 fields) doesn't inflate the enum's
     /// size in production where only the `Live` variant is ever constructed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selector-test-utils"))]
     Test(Option<Box<PathStats>>),
 }
 
@@ -1481,11 +1481,8 @@ impl<'a> PathSelectionData<'a> {
     ///
     /// `PathStats` is `#[non_exhaustive]` so callers build it via
     /// `let mut s = PathStats::default(); s.rtt = ...;`.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        network_path: &'a transports::FourTuple,
-        stats: Option<PathStats>,
-    ) -> Self {
+    #[cfg(any(test, feature = "selector-test-utils"))]
+    pub fn for_test(network_path: &'a transports::FourTuple, stats: Option<PathStats>) -> Self {
         Self {
             network_path,
             source: StatsSource::Test(stats.map(Box::new)),
@@ -1501,7 +1498,7 @@ impl<'a> PathSelectionData<'a> {
     pub fn stats(&self) -> Option<PathStats> {
         match &self.source {
             StatsSource::Live { path_id, conn } => conn.path_stats(*path_id),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "selector-test-utils"))]
             StatsSource::Test(stats) => stats.as_deref().copied(),
         }
     }
@@ -1561,6 +1558,12 @@ impl PathSelection {
     /// Returns `None` when nothing has been selected.
     pub(crate) fn selected(&self) -> Option<&transports::FourTuple> {
         self.selection.as_ref()
+    }
+
+    /// The selected path, for a test of a [`PathSelector`] outside this crate.
+    #[cfg(feature = "selector-test-utils")]
+    pub fn selected_for_test(&self) -> Option<&transports::FourTuple> {
+        self.selected()
     }
 }
 
