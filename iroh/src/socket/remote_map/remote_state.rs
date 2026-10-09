@@ -436,10 +436,10 @@ impl RemoteStateActor {
         // learn-time hook — this connection may have been created *after* a
         // custom-transport address was learned, and born on the relay path
         // that won the handshake race. Queue the book's custom addresses so
-        // the client opens them on it; see `schedule_open_custom_paths`.
+        // the client opens them on it; see `schedule_open_learned_paths`.
         {
             let known: Vec<transports::Addr> = self.state.paths.addrs().cloned().collect();
-            self.state.schedule_open_custom_paths(known.iter());
+            self.state.schedule_open_learned_paths(known.iter());
         }
 
         // Store PathId(0), set path_status and select best path, check if holepunching
@@ -684,7 +684,7 @@ impl RemoteStateActor {
             let prev_remote = self.state.selected_path.replace(addr.clone());
             if left_ip(prev_remote.as_ref(), &addr) {
                 let known: Vec<transports::Addr> = self.state.paths.addrs().cloned().collect();
-                self.state.schedule_open_custom_paths(known.iter());
+                self.state.schedule_open_learned_paths(known.iter());
             }
             event!(
                 target: "iroh::_events::path::selected",
@@ -880,8 +880,8 @@ impl State {
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
         let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).collect();
-        // habilis-network patch (Initial fan-out, part 3): see `schedule_open_custom_paths`.
-        self.schedule_open_custom_paths(addrs.iter());
+        // habilis-network patch (Initial fan-out, part 3): see `schedule_open_learned_paths`.
+        self.schedule_open_learned_paths(addrs.iter());
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
         // Start Address Lookup if we have no selected path.
@@ -959,8 +959,8 @@ impl State {
                         to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
                             .collect();
                     // habilis-network patch (Initial fan-out, part 3): see
-                    // `schedule_open_custom_paths`.
-                    self.schedule_open_custom_paths(addrs.iter());
+                    // `schedule_open_learned_paths`.
+                    self.schedule_open_learned_paths(addrs.iter());
                     self.paths.insert_multiple(addrs.into_iter(), source);
                 }
             }
@@ -1117,7 +1117,7 @@ impl State {
     }
 
     /// habilis-network patch (Initial fan-out, part 3): queue newly learned
-    /// custom-transport addresses for opening on every live connection.
+    /// custom-transport and relay addresses for opening on every live connection.
     ///
     /// Paths are only ever opened on a live connection for the *selected*
     /// address (`apply_selected_path`), and the selector can only select
@@ -1129,32 +1129,48 @@ impl State {
     /// `pending_open_paths` lets the client open it as a backup path; once
     /// validated, the configured `PathSelector` can promote it.
     ///
-    /// Custom addresses only: IP addresses have the whole holepunching
-    /// machinery, and relay addresses are re-added on `AddConnection`.
-    /// Skipped when an IP path is already selected — holepunching handles the
-    /// pair from there. A selected custom path does not skip: another custom
-    /// transport can rank above it, and only an open path lets the selector see it.
-    fn schedule_open_custom_paths<'a>(
+    /// Custom and relay addresses only: IP addresses have the whole holepunching
+    /// machinery. A relay address is added to a new connection on `AddConnection`, but
+    /// one that is learned later (`Endpoint::add_endpoint_addr`, say) is never a path of
+    /// a connection that already exists, so a pair that was dialed before its relay was
+    /// known has no relay fallback for as long as it lives. The drain opens it on each
+    /// client connection; `open_path_on_conn` skips a connection that has the exact
+    /// address already, and a relay that moved gets a path of its own.
+    ///
+    /// Custom addresses are skipped when an IP path is already selected — holepunching
+    /// handles the pair from there. A selected custom path does not skip: another custom
+    /// transport can rank above it, and only an open path lets the selector see it. The
+    /// relay is not skipped when an IP path is selected: it is the fallback for the day
+    /// that the IP path is lost. The cost is one `Backup` relay path on each client
+    /// connection of a pair that learned its relay late, with its keep-alive.
+    ///
+    /// This makes a learned relay a path. It does not make the relay learned.
+    fn schedule_open_learned_paths<'a>(
         &mut self,
         addrs: impl Iterator<Item = &'a transports::Addr>,
     ) {
-        if self
+        // An IP path that is selected skips the custom addresses (holepunching owns the pair),
+        // and not the relay: the relay is the fallback for the day that the IP path is lost.
+        let ip_selected = self
             .selected_path
             .as_ref()
-            .is_some_and(|selected| selected.is_ip())
-        {
-            return;
-        }
+            .is_some_and(|selected| selected.is_ip());
         let mut queued = false;
         for addr in addrs {
-            if !matches!(addr, transports::Addr::Custom(_)) {
+            if !matches!(
+                addr,
+                transports::Addr::Custom(_) | transports::Addr::Relay(..)
+            ) {
+                continue;
+            }
+            if ip_selected && matches!(addr, transports::Addr::Custom(_)) {
                 continue;
             }
             let four_tuple = transports::FourTuple::from_remote(addr.clone());
             if self.pending_open_paths.contains(&four_tuple) {
                 continue;
             }
-            debug!(?addr, "scheduling open_path for a learned custom address");
+            debug!(?addr, "scheduling open_path for a learned address");
             self.pending_open_paths.push_back(four_tuple);
             queued = true;
         }
@@ -1636,7 +1652,7 @@ fn queue_open_retry(
 
 /// Whether the selected path moved off an IP path to another kind.
 ///
-/// `schedule_open_custom_paths` skips a pair whose selected path is IP, so a custom
+/// `schedule_open_learned_paths` skips a pair whose selected path is IP, so a custom
 /// address learned meanwhile is queued by nobody. When the IP path goes away, the
 /// pair is pinned to its relay path unless the learned addresses are queued again.
 ///
