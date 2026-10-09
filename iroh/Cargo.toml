@@ -184,6 +184,9 @@ tls-ring = ["noq/ring", "iroh-relay/tls-ring", "iroh-dns/tls-ring"]
 tls-aws-lc-rs = ["noq/aws-lc-rs", "iroh-relay/tls-aws-lc-rs", "iroh-dns/tls-aws-lc-rs"]
 # Unstable: Custom transport API (may change without notice)
 unstable-custom-transports = []
+# Public `PathSelectionContext::for_test` and `PathSelectionData::for_test`, so that a crate that
+# implements a `PathSelector` can unit-test it on synthetic paths.
+selector-test-utils = ["unstable-custom-transports"]
 # Unstable: API to access an endpoint's NetReport (may change without notice)
 unstable-net-report = []
 
@@ -228,6 +231,11 @@ required-features = []
 [[example]]
 name = "connect"
 required-features = []
+
+[[test]]
+name = "selector_test_utils"
+path = "tests/selector_test_utils.rs"
+required-features = ["selector-test-utils"]
 
 [[example]]
 name = "custom-transport"

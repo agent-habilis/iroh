@@ -82,15 +82,32 @@ impl Preset for Arc<TestTransport> {
 /// let transport2 = network.create_transport(endpoint_id2)?;
 /// // transport1 and transport2 can now communicate via the network
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TestNetwork {
     inner: Arc<Mutex<TestNetworkInner>>,
+    transport_id: u64,
+}
+
+impl Default for TestNetwork {
+    fn default() -> Self {
+        Self::with_transport_id(TEST_TRANSPORT_ID)
+    }
 }
 
 impl TestNetwork {
     /// Creates a new empty test network.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new empty test network whose transport uses `transport_id`.
+    ///
+    /// Two endpoints can use two networks with different IDs to have two custom transports.
+    pub fn with_transport_id(transport_id: u64) -> Self {
+        Self {
+            inner: Default::default(),
+            transport_id,
+        }
     }
 
     /// Creates an address lookup service for this network.
@@ -104,7 +121,7 @@ impl TestNetwork {
     ///
     /// Returns an error if the ID already exists in the network.
     pub fn create_transport(&self, id: EndpointId) -> io::Result<Arc<TestTransport>> {
-        let id_custom = to_custom_addr(id);
+        let id_custom = custom_addr(self.transport_id, id);
         let mut guard = self.inner.lock().expect("poisoned");
         if guard.channels.contains_key(&id) {
             return Err(io::Error::other("endpoint ID already exists in network"));
@@ -148,7 +165,7 @@ impl AddressLookup for TestAddrLookup {
                 EndpointInfo {
                     endpoint_id,
                     data: EndpointData::from_iter([TransportAddr::Custom(CustomAddr::from_parts(
-                        TEST_TRANSPORT_ID,
+                        self.network.transport_id,
                         endpoint_id.as_bytes(),
                     ))]),
                 },
@@ -169,11 +186,15 @@ struct TestSender {
 
 /// Converts an endpoint ID to a custom address for this test transport.
 pub fn to_custom_addr(endpoint: EndpointId) -> CustomAddr {
-    CustomAddr::from((TEST_TRANSPORT_ID, &endpoint.as_bytes()[..]))
+    custom_addr(TEST_TRANSPORT_ID, endpoint)
 }
 
-fn try_parse_custom_addr(addr: &CustomAddr) -> io::Result<EndpointId> {
-    if addr.id() != TEST_TRANSPORT_ID {
+fn custom_addr(transport_id: u64, endpoint: EndpointId) -> CustomAddr {
+    CustomAddr::from((transport_id, &endpoint.as_bytes()[..]))
+}
+
+fn try_parse_custom_addr(transport_id: u64, addr: &CustomAddr) -> io::Result<EndpointId> {
+    if addr.id() != transport_id {
         return Err(io::Error::other("unexpected transport id"));
     }
     let key_bytes: &[u8; 32] = addr
@@ -185,7 +206,7 @@ fn try_parse_custom_addr(addr: &CustomAddr) -> io::Result<EndpointId> {
 
 impl TestSender {
     fn send_sync(&self, dst: &CustomAddr, packets: Vec<Packet>) -> io::Result<()> {
-        let to_id = try_parse_custom_addr(dst)?;
+        let to_id = try_parse_custom_addr(self.network.transport_id, dst)?;
         let guard = self.network.inner.lock().expect("poisoned");
         let (s, _) = guard
             .channels
@@ -213,7 +234,7 @@ impl TestSender {
     }
 
     fn split(&self, transmit: &Transmit) -> impl Iterator<Item = Packet> {
-        let from = to_custom_addr(self.id);
+        let from = custom_addr(self.network.transport_id, self.id);
         let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
         transmit
             .contents
@@ -227,7 +248,7 @@ impl TestSender {
 
 impl CustomSender for TestSender {
     fn is_valid_send_addr(&self, addr: &CustomAddr) -> bool {
-        addr.id() == TEST_TRANSPORT_ID
+        addr.id() == self.network.transport_id
     }
 
     fn poll_send(
@@ -296,7 +317,8 @@ impl CustomEndpoint for TestTransport {
             if buf.len() < packet.data.len() {
                 break;
             }
-            let from = try_parse_custom_addr(&packet.from).expect("valid custom addr");
+            let from = try_parse_custom_addr(self.network.transport_id, &packet.from)
+                .expect("valid custom addr");
             info!(
                 "recv {} -> {}: copying {} bytes",
                 from.fmt_short(),
@@ -304,7 +326,10 @@ impl CustomEndpoint for TestTransport {
                 packet.data.len()
             );
             buf[..packet.data.len()].copy_from_slice(&packet.data);
-            *recv_info = RecvInfo::new(packet.from, Some(to_custom_addr(self.id)));
+            *recv_info = RecvInfo::new(
+                packet.from,
+                Some(custom_addr(self.network.transport_id, self.id)),
+            );
             meta.len = packet.data.len();
             meta.stride = packet.data.len();
             count += 1;
@@ -737,6 +762,309 @@ mod tests {
         );
 
         verify_echo(&conn, b"custom wins over relay").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    const LOW_ID: u64 = TEST_TRANSPORT_ID;
+    const HIGH_ID: u64 = TEST_TRANSPORT_ID + 1;
+
+    /// Two endpoints that each have two custom transports.
+    ///
+    /// The transport with `HIGH_ID` has a 10 s RTT advantage over the one with `LOW_ID`.
+    struct TwoCustom {
+        ep1: Endpoint,
+        router: Router,
+        id2: EndpointId,
+    }
+
+    impl TwoCustom {
+        async fn new() -> Result<Self> {
+            let low_network = TestNetwork::with_transport_id(LOW_ID);
+            let high_network = TestNetwork::with_transport_id(HIGH_ID);
+            let build = |secret_key: SecretKey| {
+                let low = low_network.create_transport(secret_key.public())?;
+                let high = high_network.create_transport(secret_key.public())?;
+                let selector = BiasedRttPathSelector::default().with_bias(
+                    AddrKind::Custom(HIGH_ID),
+                    TransportBias::primary().with_rtt_advantage(Duration::from_secs(10)),
+                );
+                n0_error::Ok(
+                    Endpoint::builder(presets::N0)
+                        .secret_key(secret_key)
+                        .relay_mode(RelayMode::Disabled)
+                        .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
+                        .add_custom_transport(low)
+                        .add_custom_transport(high)
+                        .path_selector(Arc::new(selector))
+                        .clear_ip_transports(),
+                )
+            };
+            let s2 = SecretKey::generate();
+            let ep1 = build(SecretKey::generate())?.bind().await?;
+            let ep2 = build(s2.clone())?.bind().await?;
+            let router = Router::builder(ep2).accept(ECHO_ALPN, Echo).spawn();
+            Ok(Self {
+                ep1,
+                router,
+                id2: s2.public(),
+            })
+        }
+
+        fn addr(&self, transport_ids: &[u64]) -> EndpointAddr {
+            EndpointAddr::from_parts(
+                self.id2,
+                transport_ids
+                    .iter()
+                    .map(|id| TransportAddr::Custom(custom_addr(*id, self.id2))),
+            )
+        }
+
+        /// Learns the addresses without opening a connection, because a new connection
+        /// runs the path selector and would hide a missing path.
+        async fn learn(&self, transport_ids: &[u64]) -> Result<()> {
+            self.ep1
+                .inner()
+                .anyerr()?
+                .resolve_remote(self.addr(transport_ids))
+                .await
+                .anyerr()?
+                .anyerr()?;
+            Ok(())
+        }
+    }
+
+    fn is_custom_id_selected(conn: &Connection, id: u64) -> bool {
+        conn.paths().iter().any(|p| {
+            p.is_selected() && matches!(p.remote_addr(), TransportAddr::Custom(a) if a.id() == id)
+        })
+    }
+
+    /// A connection selected on a low-bias custom transport must open and select the
+    /// high-bias custom transport once its address is learned later.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_high_bias_custom_transport_wins_over_selected_custom() -> Result<()> {
+        let t = TwoCustom::new().await?;
+        let conn = t.ep1.connect(t.addr(&[LOW_ID]), ECHO_ALPN).await?;
+        assert!(
+            is_custom_id_selected(&conn, LOW_ID),
+            "low-bias path is selected first"
+        );
+
+        t.learn(&[LOW_ID, HIGH_ID]).await?;
+
+        let promoted = tokio::time::timeout(Duration::from_secs(5), async {
+            while !is_custom_id_selected(&conn, HIGH_ID) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            promoted.is_ok(),
+            "high-bias custom path must become selected, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"late high bias").await?;
+        conn.close(0u32.into(), b"done");
+        t.router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// A late low-bias address must not displace the selected high-bias path.
+    /// The cost is a backup path on the low-bias transport.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_low_bias_custom_transport_stays_backup() -> Result<()> {
+        let t = TwoCustom::new().await?;
+        let conn = t.ep1.connect(t.addr(&[HIGH_ID]), ECHO_ALPN).await?;
+        assert!(
+            is_custom_id_selected(&conn, HIGH_ID),
+            "high-bias path is selected first"
+        );
+
+        t.learn(&[LOW_ID, HIGH_ID]).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(
+            is_custom_id_selected(&conn, HIGH_ID),
+            "high-bias path stays selected, paths: {:?}",
+            conn.paths()
+        );
+        assert_eq!(
+            conn.paths().len(),
+            2,
+            "the low-bias path is open as a backup, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"low bias is backup").await?;
+        conn.close(0u32.into(), b"done");
+        t.router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// A custom address learned while an IP path is selected must not open a path:
+    /// holepunching handles that pair.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_custom_address_not_opened_while_ip_selected() -> Result<()> {
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        // Strong RTT disadvantage for custom transport
+        let custom_bias = TransportBias::primary().with_rtt_disadvantage(Duration::from_secs(10));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_custom_bias(custom_bias);
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ip_only = EndpointAddr::from_parts(
+            s2.public(),
+            ep2.addr().addrs.iter().filter(|a| a.is_ip()).cloned(),
+        );
+        let conn = ep1.connect(ip_only, ECHO_ALPN).await?;
+        assert!(
+            conn.paths()
+                .iter()
+                .any(|p| p.is_selected() && p.remote_addr().is_ip()),
+            "IP path is selected first"
+        );
+
+        ep1.inner()
+            .anyerr()?
+            .resolve_remote(mixed_addr(&ep2, s2.public()))
+            .await
+            .anyerr()?
+            .anyerr()?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(
+            !conn.paths().iter().any(|p| p.remote_addr().is_custom()),
+            "no custom path is opened while IP is selected, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"ip stays").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// Prefers IP while `ip_usable` is set. Once it is cleared, it prefers a custom
+    /// path over the relay, as `BiasedRttPathSelector` does by default.
+    #[derive(Debug)]
+    struct IpUntilCut {
+        ip_usable: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::socket::remote_map::PathSelector for IpUntilCut {
+        fn select(
+            &self,
+            ctx: &crate::socket::remote_map::PathSelectionContext<'_>,
+        ) -> crate::socket::remote_map::PathSelection {
+            let ip_usable = self.ip_usable.load(std::sync::atomic::Ordering::SeqCst);
+            let rank = |path: &crate::socket::remote_map::PathSelectionData<'_>| {
+                let tuple = path.network_path();
+                if tuple.is_ip() {
+                    if ip_usable { Some(0) } else { None }
+                } else if matches!(tuple.remote(), crate::socket::transports::Addr::Custom(_)) {
+                    Some(1)
+                } else {
+                    Some(2)
+                }
+            };
+            let best = ctx
+                .paths()
+                .filter_map(|path| rank(&path).map(|rank| (rank, path)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, path)| path);
+            let mut selection = crate::socket::remote_map::PathSelection::none();
+            if let Some(path) = best {
+                selection.set(&path);
+            }
+            selection
+        }
+    }
+
+    /// A custom address learned while an IP path is selected opens no path. When the
+    /// IP path stops being usable and the relay is selected, the custom address must
+    /// open then, or the pair stays on the relay for as long as it lives.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_late_custom_address_opens_when_ip_is_lost() -> Result<()> {
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        let ip_usable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let config = EndpointConfig::default()
+            .with_ip()
+            .with_relay(relay_map.clone());
+        let ep1 = endpoint_builder(s1, t1, config.clone())
+            .path_selector(Arc::new(IpUntilCut {
+                ip_usable: ip_usable.clone(),
+            }))
+            .bind()
+            .await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+        ep1.online().await;
+        ep2.online().await;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ip_and_relay = EndpointAddr::from_parts(
+            s2.public(),
+            ep2.addr().addrs.iter().filter(|a| !a.is_custom()).cloned(),
+        );
+        let conn = ep1.connect(ip_and_relay, ECHO_ALPN).await?;
+        assert!(
+            conn.paths()
+                .iter()
+                .any(|p| p.is_selected() && p.remote_addr().is_ip()),
+            "IP path is selected first"
+        );
+
+        ep1.inner()
+            .anyerr()?
+            .resolve_remote(mixed_addr(&ep2, s2.public()))
+            .await
+            .anyerr()?
+            .anyerr()?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !conn.paths().iter().any(|p| p.remote_addr().is_custom()),
+            "no custom path is opened while IP is selected, paths: {:?}",
+            conn.paths()
+        );
+
+        // The IP path stops being usable: the selector moves to the relay, and the
+        // network change makes it run.
+        ip_usable.store(false, std::sync::atomic::Ordering::SeqCst);
+        ep1.network_change().await;
+
+        let opened = tokio::time::timeout(Duration::from_secs(10), async {
+            while !is_custom_selected(&conn) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            opened.is_ok(),
+            "the custom path opens once IP is lost, paths: {:?}",
+            conn.paths()
+        );
+
+        verify_echo(&conn, b"custom after ip").await?;
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
