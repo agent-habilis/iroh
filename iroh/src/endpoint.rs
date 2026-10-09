@@ -1114,18 +1114,20 @@ impl Endpoint {
         ensure!(endpoint_id != self.id(), ConnectWithOptsError::SelfConnect);
         ensure!(!alpn.is_empty(), ConnectWithOptsError::InvalidAlpn);
 
+        // What the dialer knows of the remote at dial time.
+        let relay_url = endpoint_addr.relay_urls().next().cloned();
+        let ip_addresses = endpoint_addr.ip_addrs().cloned().collect::<Vec<_>>();
+
         event!(
             target: "iroh::_events::conn::connecting",
             tracing::Level::DEBUG,
             remote_id = %endpoint_id.fmt_short(),
             alpn = %String::from_utf8_lossy(alpn),
+            relay_url = ?relay_url,
+            ip_addresses = ?ip_addresses,
         );
 
-        debug!(
-            relay_url = ?endpoint_addr.relay_urls().next().cloned(),
-            ip_addresses = ?endpoint_addr.ip_addrs().cloned().collect::<Vec<_>>(),
-            "connecting",
-        );
+        debug!(?relay_url, ?ip_addresses, "connecting");
 
         let mapped_addr = self.inner.resolve_remote(endpoint_addr).await??;
 
@@ -2741,6 +2743,63 @@ mod tests {
             ConnectionError::ApplicationClosed(ApplicationClose { .. })
         ));
 
+        Ok(())
+    }
+
+    // The event of a dial says what the dialer knows of the remote, so that a dial with no relay
+    // url can be told from one that has it.
+    #[tokio::test]
+    #[traced_test]
+    async fn the_connecting_event_names_the_relay_and_the_addresses_of_the_dialer() -> Result {
+        let (relay_map, relay_url, _guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.expect("an incoming connection");
+                let conn = conn.await.anyerr()?;
+                conn.closed().await;
+                Ok::<_, Error>(())
+            }
+        });
+
+        let full = server.addr();
+        let ip = full.ip_addrs().next().cloned().expect("an IP address");
+        let conn = client.connect(full, TEST_ALPN).await?;
+
+        logs_assert(|lines| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("iroh::_events::conn::connecting"));
+            match line {
+                Some(line)
+                    if line.contains(&format!("{relay_url}"))
+                        && line.contains("relay_url=")
+                        && line.contains("ip_addresses=")
+                        && line.contains(&ip.to_string()) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "the connecting event lacks the relay url or the addresses: {other:?}"
+                )),
+            }
+        });
+        conn.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        accepting.abort();
         Ok(())
     }
 
