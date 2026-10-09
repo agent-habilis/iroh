@@ -929,6 +929,24 @@ pub enum ConnectWithOptsError {
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta, from_sources)]
 #[non_exhaustive]
+#[allow(private_interfaces)]
+pub enum AddEndpointAddrError {
+    #[error("An address of ourself is not useful")]
+    SelfAddress,
+    #[error("No addressing information available")]
+    NoAddress { source: AddressLookupFailed },
+    #[error("Internal consistency error")]
+    InternalConsistencyError {
+        /// Private source type, cannot be created publicly.
+        source: RemoteStateActorStoppedError,
+    },
+    #[error("Endpoint is closed")]
+    EndpointClosed,
+}
+
+#[allow(missing_docs)]
+#[stack_error(derive, add_meta, from_sources)]
+#[non_exhaustive]
 pub enum ConnectError {
     #[error(transparent)]
     Connect { source: ConnectWithOptsError },
@@ -1154,6 +1172,30 @@ impl Endpoint {
                 .connect_with(client_config, dest_addr, server_name)?;
 
         Ok(Connecting::new(connect, self.clone(), endpoint_id))
+    }
+
+    /// Gives this endpoint an address of a remote, without dialing it.
+    ///
+    /// The address is handled as the address of a dial is: it is added to what the endpoint
+    /// knows of the remote, and every connection to the remote can use it. A relay url or a
+    /// custom address that is added while a connection to the remote is live becomes a
+    /// path of that connection. Call this when you learn that the address of a remote
+    /// changed.
+    ///
+    /// If `addr` carries no address and the endpoint knows none, the call starts Address
+    /// Lookup, waits for it, and fails with [`AddEndpointAddrError::NoAddress`] if it
+    /// finds none.
+    pub async fn add_endpoint_addr(
+        &self,
+        addr: impl Into<EndpointAddr>,
+    ) -> Result<(), AddEndpointAddrError> {
+        if self.is_closed() {
+            return Err(e!(AddEndpointAddrError::EndpointClosed));
+        }
+        let addr: EndpointAddr = addr.into();
+        ensure!(addr.id != self.id(), AddEndpointAddrError::SelfAddress);
+        self.inner.resolve_remote(addr).await??;
+        Ok(())
     }
 
     /// Accepts an incoming connection on the endpoint.
@@ -2796,6 +2838,80 @@ mod tests {
                 )),
             }
         });
+        conn.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        accepting.abort();
+        Ok(())
+    }
+
+    // A pair that was dialed before the dialer knew the relay of the remote has no relay path on
+    // that connection. When the relay is learned later, the live connection must get a relay path
+    // as a fallback, and the IP path must stay the selected one.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_relay_added_after_the_dial_becomes_a_path_of_the_live_connection() -> Result {
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepting = tokio::spawn({
+            let (server, kept) = (server.clone(), kept.clone());
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.lock().expect("lock").push(conn);
+                    }
+                }
+            }
+        });
+
+        // The dial carries IP addresses only: no relay url.
+        let full = server.addr();
+        let ip_only = EndpointAddr::new(full.id).with_addrs(
+            full.ip_addrs()
+                .map(|addr| crate::TransportAddr::Ip(*addr))
+                .collect::<Vec<_>>(),
+        );
+        let conn = client.connect(ip_only, TEST_ALPN).await?;
+        assert!(
+            conn.paths().iter().all(|path| !path.is_relay()),
+            "dialed with no relay url, the connection starts on IP only"
+        );
+
+        // The relay url is learned, without a dial.
+        client.add_endpoint_addr(full).await?;
+
+        let mut paths = conn.paths_stream();
+        let relay_is_a_fallback = time::timeout(Duration::from_secs(5), async move {
+            while let Some(infos) = paths.next().await {
+                if infos.iter().any(|info| info.is_relay()) {
+                    let relay_selected = infos
+                        .iter()
+                        .any(|info| info.is_relay() && info.is_selected());
+                    let ip_selected = infos.iter().any(|info| info.is_ip() && info.is_selected());
+                    return ip_selected && !relay_selected;
+                }
+            }
+            false
+        })
+        .await
+        .expect("no relay path opened on the live connection");
+        assert!(
+            relay_is_a_fallback,
+            "the relay path must not be selected while the IP path is"
+        );
+
         conn.close(0u8.into(), b"");
         client.close().await;
         server.close().await;
