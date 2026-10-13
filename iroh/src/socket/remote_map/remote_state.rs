@@ -436,10 +436,10 @@ impl RemoteStateActor {
         // learn-time hook — this connection may have been created *after* a
         // custom-transport address was learned, and born on the relay path
         // that won the handshake race. Queue the book's custom addresses so
-        // the client opens them on it; see `schedule_open_custom_paths`.
+        // the client opens them on it; see `schedule_open_learned_paths`.
         {
             let known: Vec<transports::Addr> = self.state.paths.addrs().cloned().collect();
-            self.state.schedule_open_custom_paths(known.iter());
+            self.state.schedule_open_learned_paths(known.iter());
         }
 
         // Store PathId(0), set path_status and select best path, check if holepunching
@@ -682,6 +682,10 @@ impl RemoteStateActor {
             && self.state.selected_path.as_ref() != Some(&addr)
         {
             let prev_remote = self.state.selected_path.replace(addr.clone());
+            if left_ip(prev_remote.as_ref(), &addr) {
+                let known: Vec<transports::Addr> = self.state.paths.addrs().cloned().collect();
+                self.state.schedule_open_learned_paths(known.iter());
+            }
             event!(
                 target: "iroh::_events::path::selected",
                 Level::DEBUG,
@@ -876,8 +880,8 @@ impl State {
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
         let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).collect();
-        // habilis-network patch (Initial fan-out, part 3): see `schedule_open_custom_paths`.
-        self.schedule_open_custom_paths(addrs.iter());
+        // habilis-network patch (Initial fan-out, part 3): see `schedule_open_learned_paths`.
+        self.schedule_open_learned_paths(addrs.iter());
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
         // Start Address Lookup if we have no selected path.
@@ -955,8 +959,8 @@ impl State {
                         to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
                             .collect();
                     // habilis-network patch (Initial fan-out, part 3): see
-                    // `schedule_open_custom_paths`.
-                    self.schedule_open_custom_paths(addrs.iter());
+                    // `schedule_open_learned_paths`.
+                    self.schedule_open_learned_paths(addrs.iter());
                     self.paths.insert_multiple(addrs.into_iter(), source);
                 }
             }
@@ -1103,7 +1107,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        queue_open_retry(&mut self.pending_open_paths, open_addr);
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1113,7 +1117,7 @@ impl State {
     }
 
     /// habilis-network patch (Initial fan-out, part 3): queue newly learned
-    /// custom-transport addresses for opening on every live connection.
+    /// custom-transport and relay addresses for opening on every live connection.
     ///
     /// Paths are only ever opened on a live connection for the *selected*
     /// address (`apply_selected_path`), and the selector can only select
@@ -1125,31 +1129,48 @@ impl State {
     /// `pending_open_paths` lets the client open it as a backup path; once
     /// validated, the configured `PathSelector` can promote it.
     ///
-    /// Custom addresses only: IP addresses have the whole holepunching
-    /// machinery, and relay addresses are re-added on `AddConnection`.
-    /// Skipped when a non-relay path is already selected — the pair already
-    /// has a better-than-relay path, mirroring `trigger_address_lookup`.
-    fn schedule_open_custom_paths<'a>(
+    /// Custom and relay addresses only: IP addresses have the whole holepunching
+    /// machinery. A relay address is added to a new connection on `AddConnection`, but
+    /// one that is learned later (`Endpoint::add_endpoint_addr`, say) is never a path of
+    /// a connection that already exists, so a pair that was dialed before its relay was
+    /// known has no relay fallback for as long as it lives. The drain opens it on each
+    /// client connection; `open_path_on_conn` skips a connection that has the exact
+    /// address already, and a relay that moved gets a path of its own.
+    ///
+    /// Custom addresses are skipped when an IP path is already selected — holepunching
+    /// handles the pair from there. A selected custom path does not skip: another custom
+    /// transport can rank above it, and only an open path lets the selector see it. The
+    /// relay is not skipped when an IP path is selected: it is the fallback for the day
+    /// that the IP path is lost. The cost is one `Backup` relay path on each client
+    /// connection of a pair that learned its relay late, with its keep-alive.
+    ///
+    /// This makes a learned relay a path. It does not make the relay learned.
+    fn schedule_open_learned_paths<'a>(
         &mut self,
         addrs: impl Iterator<Item = &'a transports::Addr>,
     ) {
-        if self
+        // An IP path that is selected skips the custom addresses (holepunching owns the pair),
+        // and not the relay: the relay is the fallback for the day that the IP path is lost.
+        let ip_selected = self
             .selected_path
             .as_ref()
-            .is_some_and(|selected| !selected.remote().is_relay())
-        {
-            return;
-        }
+            .is_some_and(|selected| selected.is_ip());
         let mut queued = false;
         for addr in addrs {
-            if !matches!(addr, transports::Addr::Custom(_)) {
+            if !matches!(
+                addr,
+                transports::Addr::Custom(_) | transports::Addr::Relay(..)
+            ) {
+                continue;
+            }
+            if ip_selected && matches!(addr, transports::Addr::Custom(_)) {
                 continue;
             }
             let four_tuple = transports::FourTuple::from_remote(addr.clone());
             if self.pending_open_paths.contains(&four_tuple) {
                 continue;
             }
-            debug!(?addr, "scheduling open_path for a learned custom address");
+            debug!(?addr, "scheduling open_path for a learned address");
             self.pending_open_paths.push_back(four_tuple);
             queued = true;
         }
@@ -1379,7 +1400,7 @@ pub struct PathSelectionContext<'a> {
 #[derive(Debug)]
 enum PathsSource<'a> {
     Live(&'a FxHashMap<ConnId, ConnectionState>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selector-test-utils"))]
     Test(Vec<PathSelectionData<'a>>),
 }
 
@@ -1396,8 +1417,8 @@ impl<'a> PathSelectionContext<'a> {
     }
 
     /// Constructs a context with synthetic path data for testing.
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "selector-test-utils"))]
+    pub fn for_test(
         current: Option<&'a transports::FourTuple>,
         paths: Vec<PathSelectionData<'a>>,
     ) -> Self {
@@ -1428,7 +1449,7 @@ impl<'a> PathSelectionContext<'a> {
                         })
                     }),
             ),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "selector-test-utils"))]
             PathsSource::Test(paths) => Box::new(paths.iter().cloned()),
         }
     }
@@ -1455,7 +1476,7 @@ enum StatsSource {
     },
     /// Boxed so `PathStats` (100+ bytes, 14 fields) doesn't inflate the enum's
     /// size in production where only the `Live` variant is ever constructed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selector-test-utils"))]
     Test(Option<Box<PathStats>>),
 }
 
@@ -1476,11 +1497,8 @@ impl<'a> PathSelectionData<'a> {
     ///
     /// `PathStats` is `#[non_exhaustive]` so callers build it via
     /// `let mut s = PathStats::default(); s.rtt = ...;`.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        network_path: &'a transports::FourTuple,
-        stats: Option<PathStats>,
-    ) -> Self {
+    #[cfg(any(test, feature = "selector-test-utils"))]
+    pub fn for_test(network_path: &'a transports::FourTuple, stats: Option<PathStats>) -> Self {
         Self {
             network_path,
             source: StatsSource::Test(stats.map(Box::new)),
@@ -1496,7 +1514,7 @@ impl<'a> PathSelectionData<'a> {
     pub fn stats(&self) -> Option<PathStats> {
         match &self.source {
             StatsSource::Live { path_id, conn } => conn.path_stats(*path_id),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "selector-test-utils"))]
             StatsSource::Test(stats) => stats.as_deref().copied(),
         }
     }
@@ -1557,6 +1575,12 @@ impl PathSelection {
     pub(crate) fn selected(&self) -> Option<&transports::FourTuple> {
         self.selection.as_ref()
     }
+
+    /// The selected path, for a test of a [`PathSelector`] outside this crate.
+    #[cfg(feature = "selector-test-utils")]
+    pub fn selected_for_test(&self) -> Option<&transports::FourTuple> {
+        self.selected()
+    }
 }
 
 /// Poll a future once, like n0_future::future::poll_once but sync.
@@ -1611,10 +1635,95 @@ fn to_transports_addr(
     })
 }
 
+/// Queues `open_addr` to be opened again on the next scheduled attempt, unless it is queued.
+///
+/// The attempt opens each queued address on every connection of the remote, and each
+/// connection that still has no free path id queues the address again. A queued copy
+/// is enough: without this check the queue grows by the number of connections at every
+/// attempt, and a remote with a few such connections takes gigabytes in seconds.
+fn queue_open_retry(
+    queue: &mut VecDeque<transports::FourTuple>,
+    open_addr: &transports::FourTuple,
+) {
+    if !queue.contains(open_addr) {
+        queue.push_back(open_addr.clone());
+    }
+}
+
+/// Whether the selected path moved off an IP path to another kind.
+///
+/// `schedule_open_learned_paths` skips a pair whose selected path is IP, so a custom
+/// address learned meanwhile is queued by nobody. When the IP path goes away, the
+/// pair is pinned to its relay path unless the learned addresses are queued again.
+///
+/// Cost: once a pair has left IP, its custom path stays open on every connection of the
+/// pair, also after IP returns. Each custom address keeps one more path id and its
+/// keep-alive for as long as the connections live.
+fn left_ip(prev: Option<&transports::FourTuple>, now: &transports::FourTuple) -> bool {
+    prev.is_some_and(|prev| prev.is_ip()) && !now.is_ip()
+}
+
 /// Returns the next item if `maybe_stream` is `Some`, or `None` otherwise.
 async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<Option<S::Item>> {
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::*;
+
+    /// Replays the timer that retries the queue: it takes every queued address and
+    /// opens it on every connection of the remote. A connection that still has no free
+    /// path id queues the address again.
+    fn drain_pass(queue: &mut VecDeque<transports::FourTuple>, conns: usize) {
+        let mut taken = std::mem::take(queue);
+        while let Some(addr) = taken.pop_front() {
+            for _ in 0..conns {
+                queue_open_retry(queue, &addr);
+            }
+        }
+    }
+
+    // A pair on an IP path queues no learned custom address. The addresses must be queued
+    // when the pair leaves that path, or its connection stays on the relay for good.
+    #[test]
+    fn leaving_an_ip_path_is_told_from_moving_between_other_paths() {
+        let ip = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            4000,
+        ))));
+        let relay = transports::FourTuple::from_remote(transports::Addr::Relay(
+            "http://127.0.0.1:1".parse().expect("a relay url"),
+            iroh_base::SecretKey::from_bytes(&[7; 32]).public(),
+        ));
+        assert!(left_ip(Some(&ip), &relay), "IP to relay");
+        assert!(!left_ip(None, &relay), "nothing before");
+        assert!(!left_ip(Some(&relay), &ip), "relay to IP");
+        assert!(!left_ip(Some(&relay), &relay), "no move");
+    }
+
+    // A connection with no free path id queues the address for a later attempt. The
+    // timer opens the queued addresses on all connections of the remote, and each one
+    // that is still exhausted queues the address again. Without a check for a copy, the
+    // queue grows by the number of connections at every pass, without bound.
+    #[test]
+    fn exhausted_connections_do_not_grow_the_retry_queue() {
+        let addr = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            4000,
+        ))));
+        let mut queue = VecDeque::new();
+        queue_open_retry(&mut queue, &addr);
+
+        for _ in 0..5 {
+            drain_pass(&mut queue, 3);
+        }
+
+        assert_eq!(queue.len(), 1, "one address queued, once");
     }
 }
