@@ -64,13 +64,16 @@ portable-atomic = "1"
 # abandoned ones included. A path that was abandoned and has a slow estimate holds the
 # close of the whole connection for seconds. The fork takes the PTO of the open paths only.
 #
+# A backup path carries no data, so its RTT is sampled rarely and its PTO is large. The fork
+# also leaves a backup path out of that maximum while another path is open.
+#
 # `noq` and `noq-proto` come from one git source and rev, here and in `iroh-relay`, because a
 # crate from crates.io next to the fork puts two copies of the types in one graph. `noq-udp`
 # stays on crates.io: the fork takes it from there too, so `noq` and `netwatch` share one copy.
 # Pinned here, not in a `[patch]`, because `[patch]` is not inherited across workspaces. Drop
 # this hunk when upstream takes the change.
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "5f96cc2603c1414364c9eca07aa6d1ae8498374e", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "5f96cc2603c1414364c9eca07aa6d1ae8498374e", default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2e00fd44725672250ac736db73d08c7e047e1736", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2e00fd44725672250ac736db73d08c7e047e1736", default-features = false }
 noq-udp = { version = "1.1.0", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
@@ -110,7 +113,7 @@ hickory-resolver = { version = "0.26.0", default-features = false }
 # cross the portmapper/iroh boundary, so it fails to compile rather than merely
 # duplicating. Either both move or neither does.
 portmapper = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "e02960255ef2f5b2ba4aa3d4cf195e0b8673f370", optional = true, default-features = false }
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "5f96cc2603c1414364c9eca07aa6d1ae8498374e", default-features = false, features = ["runtime-tokio", "rustls"] }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2e00fd44725672250ac736db73d08c7e047e1736", default-features = false, features = ["runtime-tokio", "rustls"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
