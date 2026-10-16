@@ -665,11 +665,13 @@ fn is_orderly_accept_end(err: &AcceptError) -> bool {
 }
 
 async fn handle_connection(incoming: crate::endpoint::Incoming, protocols: Arc<ProtocolMap>) {
+    let remote_addr = incoming.remote_addr();
     let mut accepting = match incoming.accept() {
         Ok(conn) => conn,
         Err(err) => {
             log_unless_orderly!(
                 is_orderly_end(&err),
+                ?remote_addr,
                 "Ignoring connection: accepting failed: {err:#}"
             );
             return;
