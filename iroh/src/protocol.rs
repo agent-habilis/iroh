@@ -588,10 +588,11 @@ impl RouterBuilder {
                         }
 
                         let protocols = protocols.clone();
+                        let endpoint = endpoint.clone();
                         let token = handler_cancel_token.child_token();
                         let span = info_span!("router.accept", me=%endpoint.id().fmt_short(), remote=Empty, alpn=Empty);
                         join_set.spawn(async move {
-                            token.run_until_cancelled(handle_connection(incoming, protocols)).await
+                            token.run_until_cancelled(handle_connection(incoming, protocols, endpoint)).await
                         }.instrument(span));
                     },
                 }
@@ -664,7 +665,30 @@ fn is_orderly_accept_end(err: &AcceptError) -> bool {
     }
 }
 
-async fn handle_connection(incoming: crate::endpoint::Incoming, protocols: Arc<ProtocolMap>) {
+/// Whether the end of the handshake is the close of this endpoint, which has started. The app
+/// closed it on purpose, and the handshake task sees the close a moment before the router cancels
+/// it.
+fn is_endpoint_closed_end(err: &AcceptError, endpoint: &Endpoint) -> bool {
+    matches!(
+        err,
+        AcceptError::Connecting {
+            source: ConnectingError::ConnectionError {
+                source: ConnectionError::LocallyClosed,
+                ..
+            },
+            ..
+        } | AcceptError::Connection {
+            source: ConnectionError::LocallyClosed,
+            ..
+        }
+    ) && n0_future::future::now_or_never(endpoint.closed()).is_some()
+}
+
+async fn handle_connection(
+    incoming: crate::endpoint::Incoming,
+    protocols: Arc<ProtocolMap>,
+    endpoint: Endpoint,
+) {
     let remote_addr = incoming.remote_addr();
     let mut accepting = match incoming.accept() {
         Ok(conn) => conn,
@@ -707,7 +731,7 @@ async fn handle_connection(incoming: crate::endpoint::Incoming, protocols: Arc<P
         }
         Err(err) => {
             log_unless_orderly!(
-                is_orderly_accept_end(&err),
+                is_orderly_accept_end(&err) || is_endpoint_closed_end(&err, &endpoint),
                 "Accepting incoming connection ended with error: {err}"
             );
         }
@@ -1242,6 +1266,56 @@ mod tests {
         assert_no_warning!(
             "Accepting incoming connection ended with error",
             "a dialer that went silent in the handshake"
+        );
+        dialing.abort();
+        proxy.iter().for_each(|task| task.abort());
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // The app can close the endpoint of a router. A handshake that is still open then ends with
+    // `LocallyClosed`, a moment before the router cancels it. The endpoint was closed on purpose,
+    // so the router must not warn about it. A handler that is slow to shut down makes that moment
+    // long enough to see.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_handshake_that_the_close_of_the_endpoint_ends_does_not_make_the_router_warn()
+    -> Result {
+        #[derive(Debug)]
+        struct SlowToShutDown;
+
+        impl ProtocolHandler for SlowToShutDown {
+            async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+                Ok(())
+            }
+
+            async fn shutdown(&self) {
+                n0_future::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, SlowToShutDown)
+            .spawn();
+        let (proxy_addr, proxy) = proxy_to_first_packet_only(ipv4_addr(&server)).await?;
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let addr = iroh_base::EndpointAddr::new(server.id())
+            .with_addrs([iroh_base::TransportAddr::Ip(proxy_addr)]);
+
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(addr, ECHO_ALPN).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(500)).await;
+
+        server.close().await;
+        n0_future::time::sleep(Duration::from_millis(200)).await;
+
+        assert_no_warning!(
+            "Accepting incoming connection ended with error",
+            "a handshake that the close of the endpoint ended"
         );
         dialing.abort();
         proxy.iter().for_each(|task| task.abort());
