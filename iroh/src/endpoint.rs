@@ -4393,4 +4393,27 @@ mod tests {
         accepting.abort();
         Ok(())
     }
+
+    // A client that closes its endpoint ends its relay connection. The relay server sees the
+    // end of the stream. It is a normal end, and the server must not log it as a warning.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_client_that_closes_cleanly_does_not_make_the_relay_server_warn() -> Result {
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        for _ in 0..5 {
+            let client = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Custom(relay_map.clone()))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .bind()
+                .await?;
+            client.online().await;
+            client.close().await;
+        }
+        time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !logs_contain("actor errored"),
+            "the relay server warned about a clean close of a client"
+        );
+        Ok(())
+    }
 }
