@@ -33,7 +33,7 @@ use crate::{
     address_lookup::{AddressLookupFailed, AddressLookupServices, Item as AddressLookupItem},
     endpoint::DirectAddr,
     socket::{
-        Metrics as SocketMetrics, PATH_MAX_IDLE_TIMEOUT, RELAY_PATH_MAX_IDLE_TIMEOUT,
+        Metrics as SocketMetrics, RELAY_PATH_MAX_IDLE_TIMEOUT,
         mapped_addrs::{AddrMap, CustomMappedAddr, RelayMappedAddr},
         remote_map::remote_state::path_watcher::PathStateSender,
         transports::{self, OwnedTransmit, TransportsSender},
@@ -373,8 +373,8 @@ impl RemoteStateActor {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
                 self.state.handle_msg_send_datagram(sender, transmit).await;
             }
-            RemoteStateMessage::AddConnection(handle, tx) => {
-                self.handle_msg_add_connection(handle, tx);
+            RemoteStateMessage::AddConnection(handle, path_idle_timeout, tx) => {
+                self.handle_msg_add_connection(handle, path_idle_timeout, tx);
             }
             RemoteStateMessage::ResolveRemote(addrs, tx) => {
                 self.state.handle_msg_resolve_remote(addrs, tx);
@@ -399,6 +399,7 @@ impl RemoteStateActor {
     fn handle_msg_add_connection(
         &mut self,
         conn: noq::Connection,
+        path_idle_timeout: Duration,
         tx: oneshot::Sender<PathStateReceiver>,
     ) {
         let (path_state_sender, path_state_receiver) = PathStateSender::new();
@@ -429,7 +430,7 @@ impl RemoteStateActor {
                 path_state: path_state_sender,
                 paths: Default::default(),
                 closing: Default::default(),
-                path_idle_timeout: None,
+                path_idle_timeout,
                 has_been_direct: false,
             })
             .into_mut();
@@ -1285,7 +1286,11 @@ pub(crate) enum RemoteStateMessage {
     ///
     /// The actor will actively manage paths on the connection and start holepunching as needed.
     #[debug("AddConnection({})", _0.stable_id())]
-    AddConnection(noq::Connection, oneshot::Sender<PathStateReceiver>),
+    AddConnection(
+        noq::Connection,
+        Duration,
+        oneshot::Sender<PathStateReceiver>,
+    ),
     /// Asks if there is any possible path that could be used.
     ///
     /// This adds the provided transport addresses to the list of potential paths for this
@@ -1354,8 +1359,8 @@ struct ConnectionState {
     /// noq reports a closed path as abandoned a short time after the close, and until then the
     /// path stays in [`Self::paths`]. It is not open, so it does not count as a path to keep.
     closing: FxHashSet<PathId>,
-    /// The per-path idle timeout of the transport config, once a path has shown it.
-    path_idle_timeout: Option<Duration>,
+    /// The idle timeout of the paths of the connection, from its transport config.
+    path_idle_timeout: Duration,
     /// Whether this connection has ever had a direct path.
     ///
     /// Used for recording metrics.
@@ -1406,22 +1411,15 @@ impl ConnectionState {
             let Some(path) = conn.path(*path_id) else {
                 continue;
             };
-            // The first call on a path returns the default of the transport config.
-            let Ok(previous) = path.set_max_idle_timeout(None) else {
-                continue;
+            let timeout = if open.len() <= 1 {
+                None
+            } else if *is_relay {
+                Some(RELAY_PATH_MAX_IDLE_TIMEOUT)
+            } else {
+                Some(self.path_idle_timeout)
             };
-            if !is_relay && self.path_idle_timeout.is_none() {
-                self.path_idle_timeout = previous;
-            }
-            if open.len() > 1 {
-                let timeout = if *is_relay {
-                    RELAY_PATH_MAX_IDLE_TIMEOUT
-                } else {
-                    self.path_idle_timeout.unwrap_or(PATH_MAX_IDLE_TIMEOUT)
-                };
-                if let Err(e) = path.set_max_idle_timeout(Some(timeout)) {
-                    debug!(?e, "failed to set path idle timeout");
-                }
+            if let Err(e) = path.set_max_idle_timeout(timeout) {
+                debug!(?e, "failed to set path idle timeout");
             }
         }
     }

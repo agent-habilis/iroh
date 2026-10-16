@@ -1151,8 +1151,9 @@ impl Endpoint {
 
         let transport_config = options
             .transport_config
-            .map(|cfg| cfg.to_inner_arc())
-            .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
+            .unwrap_or_else(|| self.inner.static_config.transport_config.clone());
+        let path_idle_timeout = transport_config.path_idle_timeout();
+        let transport_config = transport_config.to_inner_arc();
 
         // Start connecting via noq. This will time out after 10 seconds if no reachable
         // address is available.
@@ -1171,7 +1172,12 @@ impl Endpoint {
                 .noq_endpoint()
                 .connect_with(client_config, dest_addr, server_name)?;
 
-        Ok(Connecting::new(connect, self.clone(), endpoint_id))
+        Ok(Connecting::new(
+            connect,
+            self.clone(),
+            endpoint_id,
+            path_idle_timeout,
+        ))
     }
 
     /// Gives this endpoint an address of a remote, without dialing it.
@@ -1792,6 +1798,14 @@ impl Endpoint {
     }
 
     // # Remaining private methods
+
+    /// The idle timeout of the paths of a connection that has no config of its own.
+    pub(crate) fn path_idle_timeout(&self) -> std::time::Duration {
+        self.inner
+            .static_config
+            .transport_config
+            .path_idle_timeout()
+    }
 
     /// Translates a raw [`SocketAddr`] (which may be a synthetic mapped address) into
     /// a transport address.
@@ -4420,7 +4434,7 @@ mod tests {
     /// Counts the warnings of noq-proto. `logs_contain` sees only the lines that carry the span
     /// of the test, and the timers of noq run outside of it.
     #[derive(Debug, Clone, Default)]
-    struct NoqWarnings(Arc<std::sync::atomic::AtomicUsize>);
+    struct NoqWarnings(Arc<std::sync::Mutex<Vec<String>>>);
 
     impl NoqWarnings {
         /// Counts the warnings of noq-proto on this thread until the guard is dropped.
@@ -4430,7 +4444,11 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            self.0.load(std::sync::atomic::Ordering::SeqCst)
+            self.0.lock().expect("lock").len()
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().expect("lock").clone()
         }
     }
 
@@ -4442,7 +4460,13 @@ mod tests {
         ) {
             let meta = event.metadata();
             if *meta.level() == tracing::Level::WARN && meta.target().starts_with("noq_proto") {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut text = String::new();
+                event.record(
+                    &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                        text.push_str(&format!("{}={value:?} ", field.name()));
+                    },
+                );
+                self.0.lock().expect("lock").push(text);
             }
         }
     }
@@ -4495,9 +4519,178 @@ mod tests {
         assert_eq!(
             warnings.count(),
             0,
-            "noq tried to close the last path of the connection for being idle"
+            "noq tried to close the last path of the connection for being idle: {:?}",
+            warnings.messages()
         );
         conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    // With a second path the idle timeout applies again: the IP path of a connection with a
+    // relay path idles out, because nothing keeps it alive within the short timeout, and the
+    // relay path takes over. The last path stays open, with no warning of noq.
+    #[tokio::test]
+    async fn the_idle_timeout_comes_back_when_a_second_path_opens() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let (relay_map, _relay_url, _relay_guard) = run_relay_server().await?;
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(short_idle)
+            .bind()
+            .await?;
+        client.online().await;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), TEST_ALPN).await?;
+
+        let mut paths = conn.paths_stream();
+        let mut had_two = false;
+        let mut idled_out = false;
+        let watching = time::timeout(Duration::from_secs(8), async {
+            while let Some(infos) = paths.next().await {
+                let has_ip = infos.iter().any(|info| info.is_ip());
+                let has_relay = infos.iter().any(|info| info.is_relay());
+                had_two |= has_ip && has_relay;
+                if had_two && !has_ip && has_relay {
+                    idled_out = true;
+                    break;
+                }
+            }
+        })
+        .await;
+        println!("watch finished in time: {}", watching.is_ok());
+        assert!(
+            had_two,
+            "the connection never had an IP path and a relay path"
+        );
+        assert!(
+            idled_out,
+            "the IP path never idled out beside the relay path"
+        );
+        assert_eq!(warnings.count(), 0, "noq warned about a path");
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    // A server that has the Initial of a client and never gets the rest of the handshake keeps a
+    // connection in the handshake. noq has no multipath yet for it, and it refuses to close a
+    // path for being idle and logs a warning. The path idle timeout must start after the
+    // handshake.
+    #[tokio::test]
+    async fn a_handshake_that_stalls_gets_no_path_idle_timeout() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        let server_port = server
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4())
+            .expect("an IPv4 socket")
+            .port();
+        let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    tokio::spawn(incoming.into_future());
+                }
+            }
+        });
+
+        // A proxy between the client and the server. It passes the first packet of the client,
+        // the Initial, and drops the others. The replies of the server pass.
+        let client_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let proxy_addr = client_side.local_addr().anyerr()?;
+        let server_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let client_addr = Arc::new(std::sync::Mutex::new(None));
+        let forward = tokio::spawn({
+            let (client_side, server_side, client_addr) = (
+                client_side.clone(),
+                server_side.clone(),
+                client_addr.clone(),
+            );
+            async move {
+                let mut buf = vec![0u8; 2048];
+                let mut passed = false;
+                while let Ok((len, from)) = client_side.recv_from(&mut buf).await {
+                    *client_addr.lock().expect("lock") = Some(from);
+                    if !passed {
+                        passed = true;
+                        server_side.send_to(&buf[..len], server_addr).await.ok();
+                    }
+                }
+            }
+        });
+        let backward = tokio::spawn({
+            let (client_side, server_side, client_addr) = (
+                client_side.clone(),
+                server_side.clone(),
+                client_addr.clone(),
+            );
+            async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((len, _)) = server_side.recv_from(&mut buf).await {
+                    let to = *client_addr.lock().expect("lock");
+                    if let Some(to) = to {
+                        client_side.send_to(&buf[..len], to).await.ok();
+                    }
+                }
+            }
+        });
+
+        let client = Endpoint::builder(presets::Minimal).bind().await?;
+        let to_proxy = EndpointAddr::new(server.id()).with_addrs([TransportAddr::Ip(proxy_addr)]);
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(to_proxy, TEST_ALPN).await }
+        });
+
+        time::sleep(Duration::from_secs(4)).await;
+
+        assert_eq!(
+            warnings.count(),
+            0,
+            "noq warned about a path of a connection in the handshake: {:?}",
+            warnings.messages()
+        );
+        dialing.abort();
+        forward.abort();
+        backward.abort();
         accepting.abort();
         client.close().await;
         server.close().await;

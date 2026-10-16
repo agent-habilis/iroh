@@ -1373,13 +1373,19 @@ impl EndpointInner {
         &self,
         remote: EndpointId,
         conn: noq::Connection,
+        path_idle_timeout: Duration,
     ) -> impl Future<Output = Result<PathStateReceiver, RemoteStateActorStoppedError>> + Send + 'static
     {
         let (tx, rx) = oneshot::channel();
         let sender = self.actor_sender.clone();
         async move {
             sender
-                .send(ActorMessage::AddConnection(remote, conn, tx))
+                .send(ActorMessage::AddConnection(
+                    remote,
+                    conn,
+                    path_idle_timeout,
+                    tx,
+                ))
                 .await
                 .map_err(|_| RemoteStateActorStoppedError::new())?;
             rx.await.map_err(|_| RemoteStateActorStoppedError::new())
@@ -1401,6 +1407,7 @@ enum ActorMessage {
     AddConnection(
         EndpointId,
         noq::Connection,
+        Duration,
         oneshot::Sender<PathStateReceiver>,
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
@@ -1797,8 +1804,10 @@ impl Actor {
             ActorMessage::ResolveRemote(addr, tx) => {
                 self.remote_map.resolve_remote(addr, tx).await;
             }
-            ActorMessage::AddConnection(remote, conn, tx) => {
-                self.remote_map.add_connection(remote, conn, tx).await;
+            ActorMessage::AddConnection(remote, conn, path_idle_timeout, tx) => {
+                self.remote_map
+                    .add_connection(remote, conn, path_idle_timeout, tx)
+                    .await;
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]
