@@ -657,7 +657,7 @@ impl RemoteStateActor {
                 self.select_path();
             }
             NoqPathEvent::Discarded { id, path_stats, .. } => {
-                trace!(%id, ?path_stats, "path discarded");
+                debug!(%conn_id, path_id = %id, ?path_stats, "path discarded");
             }
             NoqPathEvent::RemoteStatus { .. } | NoqPathEvent::ObservedAddr { .. } => {
                 // Nothing to do for these events.
@@ -1418,9 +1418,14 @@ impl ConnectionState {
             } else {
                 Some(self.path_idle_timeout)
             };
-            if let Err(e) = path.set_max_idle_timeout(timeout) {
-                debug!(?e, "failed to set path idle timeout");
-            }
+            let result = path.set_max_idle_timeout(timeout);
+            debug!(
+                conn_id = %ConnId(conn.stable_id()),
+                %path_id,
+                ?timeout,
+                ?result,
+                "set path idle timeout"
+            );
         }
     }
 
