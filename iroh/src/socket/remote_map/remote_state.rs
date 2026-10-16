@@ -33,7 +33,7 @@ use crate::{
     address_lookup::{AddressLookupFailed, AddressLookupServices, Item as AddressLookupItem},
     endpoint::DirectAddr,
     socket::{
-        Metrics as SocketMetrics, RELAY_PATH_MAX_IDLE_TIMEOUT,
+        Metrics as SocketMetrics, PATH_MAX_IDLE_TIMEOUT, RELAY_PATH_MAX_IDLE_TIMEOUT,
         mapped_addrs::{AddrMap, CustomMappedAddr, RelayMappedAddr},
         remote_map::remote_state::path_watcher::PathStateSender,
         transports::{self, OwnedTransmit, TransportsSender},
@@ -429,6 +429,7 @@ impl RemoteStateActor {
                 path_state: path_state_sender,
                 paths: Default::default(),
                 closing: Default::default(),
+                path_idle_timeout: None,
                 has_been_direct: false,
             })
             .into_mut();
@@ -449,6 +450,7 @@ impl RemoteStateActor {
             let path_remote = self
                 .state
                 .register_and_configure_path(conn_id, conn_state, &path);
+            conn_state.update_path_idle_timeouts(&conn);
 
             if let Some(path_remote) = path_remote
                 && !path_remote.is_relay()
@@ -618,6 +620,7 @@ impl RemoteStateActor {
 
                 self.state
                     .register_and_configure_path(conn_id, conn_state, &path);
+                conn_state.update_path_idle_timeouts(&conn);
                 self.select_path();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
@@ -626,6 +629,7 @@ impl RemoteStateActor {
                     debug!(%id, "path not in path_id_map");
                     return;
                 };
+                conn_state.update_path_idle_timeouts(&conn);
 
                 // We track all known remote addresses for the peer in `State::paths`. The paths are tracked
                 // by remote address only (we ignore the local IP). Therefore, we mark a remote addr as abandoned
@@ -769,6 +773,8 @@ impl RemoteStateActor {
                 // Set path status: The selected path becomes Available, all other paths become Backup.
                 self.state.set_path_status(*conn_id, &path, path_remote);
             }
+
+            conn_state.update_path_idle_timeouts(&conn);
 
             // Record the new selected path in the path watcher.
             conn_state.path_state.record_selected(&selected);
@@ -1029,10 +1035,8 @@ impl State {
     ///
     /// This inserts the path in the [`ConnectionState`] and [`Self::paths`].
     ///
-    /// It configures the path with the correct path status (see [`Self::set_path_status`]),
-    /// and applies path-type-specific settings:
-    /// Relay paths get a longer idle timeout to accommodate transparent reconnection
-    /// by the relay actor (see [`RELAY_PATH_MAX_IDLE_TIMEOUT`]).
+    /// It configures the path with the correct path status (see [`Self::set_path_status`]).
+    /// The idle timeout of the path is set by [`ConnectionState::update_path_idle_timeouts`].
     fn register_and_configure_path(
         &mut self,
         conn_id: ConnId,
@@ -1049,12 +1053,6 @@ impl State {
             %network_path,
         );
         conn_state.add_open_path(network_path.clone(), path.id(), &self.metrics);
-        if network_path.is_relay()
-            && let Err(e) = path.set_max_idle_timeout(Some(RELAY_PATH_MAX_IDLE_TIMEOUT))
-        {
-            debug!(?e, "failed to set relay path idle timeout");
-        }
-
         self.set_path_status(conn_id, path, &network_path);
         self.paths
             .insert_open_path(network_path.remote(), Source::Connection);
@@ -1356,6 +1354,8 @@ struct ConnectionState {
     /// noq reports a closed path as abandoned a short time after the close, and until then the
     /// path stays in [`Self::paths`]. It is not open, so it does not count as a path to keep.
     closing: FxHashSet<PathId>,
+    /// The per-path idle timeout of the transport config, once a path has shown it.
+    path_idle_timeout: Option<Duration>,
     /// Whether this connection has ever had a direct path.
     ///
     /// Used for recording metrics.
@@ -1386,6 +1386,43 @@ impl ConnectionState {
         {
             let handle = path.weak_handle();
             self.path_state.record_opened(handle, network_path);
+        }
+    }
+
+    /// Sets the idle timeout of the open paths of the connection.
+    ///
+    /// A path that idles is closed by noq. That is useful only when another path can carry
+    /// the connection. With one open path, noq refuses to close it and logs a warning, and the
+    /// connection idle timeout ends the connection anyway. So the paths have no idle timeout
+    /// while only one is open, and get it back when a second one opens.
+    fn update_path_idle_timeouts(&mut self, conn: &noq::Connection) {
+        let open: Vec<_> = self
+            .paths
+            .iter()
+            .filter(|(id, _)| !self.closing.contains(*id))
+            .map(|(id, addr)| (*id, addr.is_relay()))
+            .collect();
+        for (path_id, is_relay) in &open {
+            let Some(path) = conn.path(*path_id) else {
+                continue;
+            };
+            // The first call on a path returns the default of the transport config.
+            let Ok(previous) = path.set_max_idle_timeout(None) else {
+                continue;
+            };
+            if !is_relay && self.path_idle_timeout.is_none() {
+                self.path_idle_timeout = previous;
+            }
+            if open.len() > 1 {
+                let timeout = if *is_relay {
+                    RELAY_PATH_MAX_IDLE_TIMEOUT
+                } else {
+                    self.path_idle_timeout.unwrap_or(PATH_MAX_IDLE_TIMEOUT)
+                };
+                if let Err(e) = path.set_max_idle_timeout(Some(timeout)) {
+                    debug!(?e, "failed to set path idle timeout");
+                }
+            }
         }
     }
 

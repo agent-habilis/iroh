@@ -4416,4 +4416,91 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Counts the warnings of noq-proto. `logs_contain` sees only the lines that carry the span
+    /// of the test, and the timers of noq run outside of it.
+    #[derive(Debug, Clone, Default)]
+    struct NoqWarnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl NoqWarnings {
+        /// Counts the warnings of noq-proto on this thread until the guard is dropped.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NoqWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() == tracing::Level::WARN && meta.target().starts_with("noq_proto") {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    // The per-path idle timeout closes an idle path. A connection with one path cannot close
+    // it: noq refuses with `LastOpenPath` and logs a warning, and the connection idle timeout
+    // ends the connection anyway. The path idle timeout must apply only when the connection has
+    // more than one open path.
+    #[tokio::test]
+    async fn the_last_path_of_a_connection_gets_no_idle_timeout() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let local = |builder: super::Builder| {
+            builder
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .expect("valid address")
+        };
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = local(Endpoint::builder(presets::Minimal).alpns(vec![TEST_ALPN.to_vec()]))
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        let client = local(Endpoint::builder(presets::Minimal))
+            .transport_config(short_idle)
+            .bind()
+            .await?;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), TEST_ALPN).await?;
+        assert_eq!(
+            conn.paths().iter().count(),
+            1,
+            "the connection has one path"
+        );
+
+        time::sleep(Duration::from_secs(4)).await;
+
+        assert_eq!(
+            warnings.count(),
+            0,
+            "noq tried to close the last path of the connection for being idle"
+        );
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
 }
