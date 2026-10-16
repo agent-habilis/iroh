@@ -57,7 +57,10 @@ use tracing::{Instrument, debug, error, field::Empty, info_span, trace, warn};
 
 use crate::{
     Endpoint,
-    endpoint::{Accepting, Connection, RemoteEndpointIdError, quic},
+    endpoint::{
+        Accepting, AlpnError, ConnectingError, Connection, ConnectionError, RemoteEndpointIdError,
+        quic,
+    },
 };
 
 /// The built router.
@@ -622,18 +625,64 @@ impl RouterBuilder {
     }
 }
 
+/// Logs at debug level if `orderly`, and at warn level otherwise.
+macro_rules! log_unless_orderly {
+    ($orderly:expr, $($arg:tt)+) => {
+        if $orderly {
+            debug!($($arg)+)
+        } else {
+            warn!($($arg)+)
+        }
+    };
+}
+
+/// Whether the remote caused the end of a connection attempt, and this endpoint stays healthy.
+///
+/// The remote can close, or go silent. Neither is a fault of this endpoint, and it cannot act on
+/// them. All other errors need a warning, because they point to a fault or a misconfiguration:
+/// for example a bad certificate, an ALPN that the dialer and this endpoint do not agree on, or a
+/// failure of this endpoint.
+fn is_orderly_end(err: &ConnectionError) -> bool {
+    matches!(
+        err,
+        ConnectionError::TimedOut
+            | ConnectionError::ConnectionClosed(_)
+            | ConnectionError::ApplicationClosed(_)
+            | ConnectionError::Reset
+    )
+}
+
+/// Like [`is_orderly_end`], for the errors of the handshake that wrap a [`ConnectionError`].
+fn is_orderly_accept_end(err: &AcceptError) -> bool {
+    match err {
+        AcceptError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        }
+        | AcceptError::Connection { source, .. } => is_orderly_end(source),
+        _ => false,
+    }
+}
+
 async fn handle_connection(incoming: crate::endpoint::Incoming, protocols: Arc<ProtocolMap>) {
     let mut accepting = match incoming.accept() {
         Ok(conn) => conn,
         Err(err) => {
-            warn!("Ignoring connection: accepting failed: {err:#}");
+            log_unless_orderly!(
+                is_orderly_end(&err),
+                "Ignoring connection: accepting failed: {err:#}"
+            );
             return;
         }
     };
     let alpn = match accepting.alpn().await {
         Ok(alpn) => alpn,
         Err(err) => {
-            warn!("Ignoring connection: invalid handshake: {err:#}");
+            let orderly = matches!(
+                &err,
+                AlpnError::ConnectionError { source, .. } if is_orderly_end(source)
+            );
+            log_unless_orderly!(orderly, "Ignoring connection: invalid handshake: {err:#}");
             return;
         }
     };
@@ -655,7 +704,10 @@ async fn handle_connection(incoming: crate::endpoint::Incoming, protocols: Arc<P
             }
         }
         Err(err) => {
-            warn!("Accepting incoming connection ended with error: {err}");
+            log_unless_orderly!(
+                is_orderly_accept_end(&err),
+                "Accepting incoming connection ended with error: {err}"
+            );
         }
     }
 }
@@ -1055,5 +1107,181 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    /// Starts a UDP proxy between a client and `server_addr`. It passes the first packet of the
+    /// client, the Initial, and drops the others. The replies of the server pass unchanged.
+    /// Returns the address for the client to dial, and the tasks of the proxy.
+    async fn proxy_to_first_packet_only(
+        server_addr: std::net::SocketAddr,
+    ) -> Result<(std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>)> {
+        let client_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let proxy_addr = client_side.local_addr().anyerr()?;
+        let server_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let client_addr = Arc::new(Mutex::new(None));
+        let forward = tokio::spawn({
+            let (client_side, server_side, client_addr) = (
+                client_side.clone(),
+                server_side.clone(),
+                client_addr.clone(),
+            );
+            async move {
+                let mut buf = vec![0u8; 2048];
+                let mut passed = false;
+                while let Ok((len, from)) = client_side.recv_from(&mut buf).await {
+                    *client_addr.lock().expect("lock") = Some(from);
+                    if passed {
+                        continue;
+                    }
+                    passed = true;
+                    server_side.send_to(&buf[..len], server_addr).await.ok();
+                }
+            }
+        });
+        let backward = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((len, _)) = server_side.recv_from(&mut buf).await {
+                let to = *client_addr.lock().expect("lock");
+                if let Some(to) = to {
+                    client_side.send_to(&buf[..len], to).await.ok();
+                }
+            }
+        });
+        Ok((proxy_addr, vec![forward, backward]))
+    }
+
+    /// Fails if the log of the test has a line at warn level or higher with `message`.
+    ///
+    /// `logs_contain` matches the lines of every level. This is a macro because
+    /// `logs_assert` exists only inside the test function.
+    macro_rules! assert_no_warning {
+        ($message:expr, $about:expr) => {
+            logs_assert(|lines: &[&str]| {
+                let warned = lines.iter().any(|line| {
+                    (line.contains(" WARN ") || line.contains(" ERROR ")) && line.contains($message)
+                });
+                if warned {
+                    Err(format!("the router warned about {}", $about))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+    }
+
+    fn ipv4_addr(endpoint: &Endpoint) -> std::net::SocketAddr {
+        let port = endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4())
+            .expect("an IPv4 socket")
+            .port();
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+    }
+
+    // A dialer and a router that do not agree on an ALPN are misconfigured: one of them has the
+    // wrong protocol. The warning of the router is the only signal of it, so it must stay.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dialer_with_an_unknown_alpn_makes_the_router_warn() -> Result {
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, Echo)
+            .spawn();
+        let client = Endpoint::bind(presets::Minimal).await?;
+
+        let res = client.connect(server.addr(), b"/iroh/other/1").await;
+        assert!(res.is_err(), "the router serves no such ALPN");
+        n0_future::time::sleep(Duration::from_millis(300)).await;
+
+        logs_assert(|lines: &[&str]| {
+            let warned = lines.iter().any(|line| {
+                line.contains(" WARN ") && line.contains("Ignoring connection: accepting failed")
+            });
+            if warned {
+                Ok(())
+            } else {
+                Err("the router did not warn about a dialer with an unknown ALPN".to_string())
+            }
+        });
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // A dialer that sends its Initial and goes silent leaves the handshake open until the idle
+    // timeout of the router. The router is healthy and must not warn about the timeout.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dialer_that_goes_silent_in_the_handshake_does_not_make_the_router_warn() -> Result {
+        let short_idle = crate::endpoint::QuicTransportConfig::builder()
+            .max_idle_timeout(Some(
+                crate::endpoint::IdleTimeout::try_from(Duration::from_secs(1)).anyerr()?,
+            ))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .transport_config(short_idle)
+            .bind()
+            .await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, Echo)
+            .spawn();
+        let (proxy_addr, proxy) = proxy_to_first_packet_only(ipv4_addr(&server)).await?;
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let addr = iroh_base::EndpointAddr::new(server.id())
+            .with_addrs([iroh_base::TransportAddr::Ip(proxy_addr)]);
+
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(addr, ECHO_ALPN).await }
+        });
+        n0_future::time::sleep(Duration::from_secs(4)).await;
+
+        assert_no_warning!(
+            "Accepting incoming connection ended with error",
+            "a dialer that went silent in the handshake"
+        );
+        dialing.abort();
+        proxy.iter().for_each(|task| task.abort());
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // The rule that decides which end of a connection attempt gets a warning. The ends that the
+    // remote causes are orderly. All the others stay warnings, because they point to a fault or a
+    // misconfiguration.
+    #[test]
+    fn the_router_warns_only_for_the_ends_that_the_remote_did_not_cause() {
+        use crate::endpoint::{ApplicationClose, TransportError, TransportErrorCode};
+
+        let alert =
+            |code| ConnectionError::TransportError(TransportError::new(code, String::new()));
+        for orderly in [
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: 0u8.into(),
+                reason: Default::default(),
+            }),
+        ] {
+            assert!(is_orderly_end(&orderly), "{orderly:?} must be orderly");
+        }
+        for unexpected in [
+            ConnectionError::LocallyClosed,
+            ConnectionError::CidsExhausted,
+            ConnectionError::VersionMismatch,
+            // no_application_protocol: the dialer and the router disagree on the ALPN
+            alert(TransportErrorCode::crypto(120)),
+            // bad_certificate
+            alert(TransportErrorCode::crypto(42)),
+            // another alert: handshake_failure
+            alert(TransportErrorCode::crypto(40)),
+        ] {
+            assert!(
+                !is_orderly_end(&unexpected),
+                "{unexpected:?} must stay a warning"
+            );
+        }
     }
 }
