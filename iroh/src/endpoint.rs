@@ -4696,4 +4696,116 @@ mod tests {
         server.close().await;
         Ok(())
     }
+
+    /// Opens a connection over an IP path and a relay path, with a path idle timeout of 15 s on
+    /// the endpoints and a short one on a single side. Returns whether the IP path idled out
+    /// beside the relay path within 8 s.
+    async fn ip_path_idles_out_with_a_short_timeout_on(side: ShortIdleOn) -> Result<bool> {
+        let (relay_map, _relay_url, _relay_guard) = run_relay_server().await?;
+        let short = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        client.online().await;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            let short = short.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    let accepted = if side == ShortIdleOn::AcceptWith {
+                        let config = server
+                            .create_server_config_builder(vec![TEST_ALPN.to_vec()])
+                            .set_transport_config(short.clone())
+                            .build();
+                        incoming
+                            .accept_with(Arc::new(config))
+                            .expect("accept with a config")
+                            .await
+                    } else {
+                        incoming.await
+                    };
+                    if let Ok(conn) = accepted {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = if side == ShortIdleOn::ConnectOptions {
+            let opts = super::ConnectOptions::new().with_transport_config(short);
+            client
+                .connect_with_opts(server.addr(), TEST_ALPN, opts)
+                .await?
+                .await?
+        } else {
+            client.connect(server.addr(), TEST_ALPN).await?
+        };
+
+        let mut paths = conn.paths_stream();
+        let mut had_two = false;
+        let mut idled_out = false;
+        time::timeout(Duration::from_secs(8), async {
+            while let Some(infos) = paths.next().await {
+                let has_ip = infos.iter().any(|info| info.is_ip());
+                let has_relay = infos.iter().any(|info| info.is_relay());
+                had_two |= has_ip && has_relay;
+                if had_two && !has_ip && has_relay {
+                    idled_out = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .ok();
+        assert!(
+            had_two,
+            "the connection never had an IP path and a relay path"
+        );
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(idled_out)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ShortIdleOn {
+        /// The config of the connection that the client opens.
+        ConnectOptions,
+        /// The config of the connection that the server accepts.
+        AcceptWith,
+    }
+
+    // The path idle timeout of the config of one connection counts, and not the one of the
+    // endpoint. The client has 15 s on its endpoint and 1 s in the options of the connection, and
+    // the server keeps 15 s, so only the client closes the idle IP path.
+    #[tokio::test]
+    async fn the_path_idle_timeout_of_the_connect_options_is_used() -> Result {
+        assert!(
+            ip_path_idles_out_with_a_short_timeout_on(ShortIdleOn::ConnectOptions).await?,
+            "the IP path did not idle out with a short timeout in the connect options"
+        );
+        Ok(())
+    }
+
+    // The same on the server: 1 s in the server config of `accept_with`, 15 s on the client.
+    #[tokio::test]
+    async fn the_path_idle_timeout_of_accept_with_is_used() -> Result {
+        assert!(
+            ip_path_idles_out_with_a_short_timeout_on(ShortIdleOn::AcceptWith).await?,
+            "the IP path did not idle out with a short timeout in the server config"
+        );
+        Ok(())
+    }
 }
