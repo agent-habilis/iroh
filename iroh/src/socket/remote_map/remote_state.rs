@@ -1407,6 +1407,11 @@ impl ConnectionState {
             .filter(|(id, _)| !self.closing.contains(*id))
             .map(|(id, addr)| (*id, addr.is_relay()))
             .collect();
+        for path_id in &self.closing {
+            if let Some(path) = conn.path(*path_id) {
+                path.set_max_idle_timeout(None).ok();
+            }
+        }
         for (path_id, is_relay) in &open {
             let Some(path) = conn.path(*path_id) else {
                 continue;
@@ -1437,6 +1442,12 @@ impl ConnectionState {
     ) -> Option<transports::FourTuple> {
         self.closing.remove(path_id);
         let addr = self.paths.remove(path_id)?;
+        // noq keeps the path until it is drained, and it arms the idle timer again for each
+        // packet on the path or for a timeout that we set before we saw the event. The timer
+        // then fires on a path that is closed already.
+        if let Some(path) = conn.path(*path_id) {
+            path.set_max_idle_timeout(None).ok();
+        }
         self.path_state.record_abandoned(*path_id, conn);
         Some(addr)
     }
