@@ -355,8 +355,12 @@ where
                     break;
                 }
                 maybe_frame = self.stream.next() => {
+                    let Some(frame) = maybe_frame else {
+                        trace!("client closed the stream, exiting");
+                        break;
+                    };
                     self
-                        .handle_frame(maybe_frame)
+                        .handle_frame(frame)
                         .await?;
                     // reset the ping interval, we just received a message
                     ping_interval.reset();
@@ -442,13 +446,10 @@ where
     /// Handles frame read results.
     async fn handle_frame(
         &mut self,
-        maybe_frame: Option<Result<ClientToRelayMsg, RelayRecvError>>,
+        frame: Result<ClientToRelayMsg, RelayRecvError>,
     ) -> Result<(), HandleFrameError> {
-        trace!(?maybe_frame, "handle incoming frame");
-        let frame = match maybe_frame {
-            Some(frame) => frame?,
-            None => return Err(e!(HandleFrameError::StreamTerminated)),
-        };
+        trace!(?frame, "handle incoming frame");
+        let frame = frame?;
 
         match frame {
             ClientToRelayMsg::Datagrams {

@@ -17,7 +17,7 @@ use n0_future::{
 use n0_watcher::Watcher;
 use noq::{Closed, PathStats, PathStatus, WeakConnectionHandle};
 use noq_proto::{PathError, PathEvent as NoqPathEvent, PathId, n0_nat_traversal};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
@@ -373,11 +373,14 @@ impl RemoteStateActor {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
                 self.state.handle_msg_send_datagram(sender, transmit).await;
             }
-            RemoteStateMessage::AddConnection(handle, tx) => {
-                self.handle_msg_add_connection(handle, tx);
+            RemoteStateMessage::AddConnection(handle, path_idle_timeout, tx) => {
+                self.handle_msg_add_connection(handle, path_idle_timeout, tx);
             }
             RemoteStateMessage::ResolveRemote(addrs, tx) => {
                 self.state.handle_msg_resolve_remote(addrs, tx);
+            }
+            RemoteStateMessage::RemoveAddrs(addrs, tx) => {
+                self.handle_msg_remove_addrs(addrs, tx);
             }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
@@ -399,6 +402,7 @@ impl RemoteStateActor {
     fn handle_msg_add_connection(
         &mut self,
         conn: noq::Connection,
+        path_idle_timeout: Duration,
         tx: oneshot::Sender<PathStateReceiver>,
     ) {
         let (path_state_sender, path_state_receiver) = PathStateSender::new();
@@ -428,6 +432,8 @@ impl RemoteStateActor {
                 handle: conn.weak_handle(),
                 path_state: path_state_sender,
                 paths: Default::default(),
+                closing: Default::default(),
+                path_idle_timeout,
                 has_been_direct: false,
             })
             .into_mut();
@@ -448,6 +454,7 @@ impl RemoteStateActor {
             let path_remote = self
                 .state
                 .register_and_configure_path(conn_id, conn_state, &path);
+            conn_state.update_path_idle_timeouts(&conn);
 
             if let Some(path_remote) = path_remote
                 && !path_remote.is_relay()
@@ -471,6 +478,28 @@ impl RemoteStateActor {
         self.trigger_holepunching();
         self.select_path();
         tx.send(path_state_receiver).ok();
+    }
+
+    /// Handles [`RemoteStateMessage::RemoveAddrs`].
+    fn handle_msg_remove_addrs(&mut self, addrs: BTreeSet<TransportAddr>, tx: oneshot::Sender<()>) {
+        let addrs: Vec<_> = to_transports_addr(self.state.endpoint_id, addrs).collect();
+        for addr in &addrs {
+            self.state.paths.remove(addr);
+        }
+        for conn_state in self.connections.values() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            for (path_id, network_path) in &conn_state.paths {
+                if addrs.contains(&network_path.remote())
+                    && let Some(path) = conn.path(*path_id)
+                {
+                    // Refused for the last path of the connection, which stays.
+                    path.close().ok();
+                }
+            }
+        }
+        tx.send(()).ok();
     }
 
     /// Handles [`RemoteStateMessage::NetworkChange`].
@@ -617,6 +646,7 @@ impl RemoteStateActor {
 
                 self.state
                     .register_and_configure_path(conn_id, conn_state, &path);
+                conn_state.update_path_idle_timeouts(&conn);
                 self.select_path();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
@@ -625,6 +655,7 @@ impl RemoteStateActor {
                     debug!(%id, "path not in path_id_map");
                     return;
                 };
+                conn_state.update_path_idle_timeouts(&conn);
 
                 // We track all known remote addresses for the peer in `State::paths`. The paths are tracked
                 // by remote address only (we ignore the local IP). Therefore, we mark a remote addr as abandoned
@@ -651,7 +682,7 @@ impl RemoteStateActor {
                 self.select_path();
             }
             NoqPathEvent::Discarded { id, path_stats, .. } => {
-                trace!(%id, ?path_stats, "path discarded");
+                debug!(%conn_id, path_id = %id, ?path_stats, "path discarded");
             }
             NoqPathEvent::RemoteStatus { .. } | NoqPathEvent::ObservedAddr { .. } => {
                 // Nothing to do for these events.
@@ -714,7 +745,7 @@ impl RemoteStateActor {
             return;
         };
 
-        for (conn_id, conn_state) in self.connections.iter() {
+        for (conn_id, conn_state) in self.connections.iter_mut() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
@@ -724,6 +755,9 @@ impl RemoteStateActor {
                 .open_path_on_conn(*conn_id, conn_state, &conn, &selected);
 
             for (path_id, path_remote) in conn_state.paths.iter() {
+                if conn_state.closing.contains(path_id) {
+                    continue;
+                }
                 let Some(path) = conn.path(*path_id) else {
                     continue;
                 };
@@ -736,7 +770,12 @@ impl RemoteStateActor {
                 if conn.side().is_client()
                     && path_remote.is_ip()
                     && path_remote != &selected
-                    && conn_state.paths.values().filter(|a| a.is_ip()).count() > 1
+                    && conn_state
+                        .paths
+                        .iter()
+                        .filter(|(id, a)| a.is_ip() && !conn_state.closing.contains(*id))
+                        .count()
+                        > 1
                 {
                     trace!(?path_remote, %conn_id, %path_id, "closing direct path");
                     match path.close() {
@@ -748,8 +787,11 @@ impl RemoteStateActor {
                         }
                         Err(noq_proto::ClosePathError::ClosedPath) => {
                             // We already closed this.
+                            conn_state.closing.insert(*path_id);
                         }
-                        Ok(()) => {}
+                        Ok(()) => {
+                            conn_state.closing.insert(*path_id);
+                        }
                     }
                     continue;
                 }
@@ -757,6 +799,8 @@ impl RemoteStateActor {
                 // Set path status: The selected path becomes Available, all other paths become Backup.
                 self.state.set_path_status(*conn_id, &path, path_remote);
             }
+
+            conn_state.update_path_idle_timeouts(&conn);
 
             // Record the new selected path in the path watcher.
             conn_state.path_state.record_selected(&selected);
@@ -1017,10 +1061,8 @@ impl State {
     ///
     /// This inserts the path in the [`ConnectionState`] and [`Self::paths`].
     ///
-    /// It configures the path with the correct path status (see [`Self::set_path_status`]),
-    /// and applies path-type-specific settings:
-    /// Relay paths get a longer idle timeout to accommodate transparent reconnection
-    /// by the relay actor (see [`RELAY_PATH_MAX_IDLE_TIMEOUT`]).
+    /// It configures the path with the correct path status (see [`Self::set_path_status`]).
+    /// The idle timeout of the path is set by [`ConnectionState::update_path_idle_timeouts`].
     fn register_and_configure_path(
         &mut self,
         conn_id: ConnId,
@@ -1037,12 +1079,6 @@ impl State {
             %network_path,
         );
         conn_state.add_open_path(network_path.clone(), path.id(), &self.metrics);
-        if network_path.is_relay()
-            && let Err(e) = path.set_max_idle_timeout(Some(RELAY_PATH_MAX_IDLE_TIMEOUT))
-        {
-            debug!(?e, "failed to set relay path idle timeout");
-        }
-
         self.set_path_status(conn_id, path, &network_path);
         self.paths
             .insert_open_path(network_path.remote(), Source::Connection);
@@ -1275,7 +1311,11 @@ pub(crate) enum RemoteStateMessage {
     ///
     /// The actor will actively manage paths on the connection and start holepunching as needed.
     #[debug("AddConnection({})", _0.stable_id())]
-    AddConnection(noq::Connection, oneshot::Sender<PathStateReceiver>),
+    AddConnection(
+        noq::Connection,
+        Duration,
+        oneshot::Sender<PathStateReceiver>,
+    ),
     /// Asks if there is any possible path that could be used.
     ///
     /// This adds the provided transport addresses to the list of potential paths for this
@@ -1289,6 +1329,10 @@ pub(crate) enum RemoteStateMessage {
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
     ),
+    /// Forgets these transport addresses of the remote, and closes the paths of the live
+    /// connections that run to them, unless one is the last path of its connection.
+    #[debug("RemoveAddrs(..)")]
+    RemoveAddrs(BTreeSet<TransportAddr>, oneshot::Sender<()>),
     /// Returns information about the remote.
     ///
     /// This currently only includes a list of all known transport addresses for the remote.
@@ -1339,6 +1383,13 @@ struct ConnectionState {
     path_state: PathStateSender,
     /// The open paths that exist on this connection.
     paths: FxHashMap<PathId, transports::FourTuple>,
+    /// The paths in [`Self::paths`] that this endpoint has closed.
+    ///
+    /// noq reports a closed path as abandoned a short time after the close, and until then the
+    /// path stays in [`Self::paths`]. It is not open, so it does not count as a path to keep.
+    closing: FxHashSet<PathId>,
+    /// The idle timeout of the paths of the connection, from its transport config.
+    path_idle_timeout: Duration,
     /// Whether this connection has ever had a direct path.
     ///
     /// Used for recording metrics.
@@ -1372,13 +1423,60 @@ impl ConnectionState {
         }
     }
 
+    /// Sets the idle timeout of the open paths of the connection.
+    ///
+    /// A path that idles is closed by noq. That is useful only when another path can carry
+    /// the connection. With one open path, noq refuses to close it and logs a warning, and the
+    /// connection idle timeout ends the connection anyway. So the paths have no idle timeout
+    /// while only one is open, and get it back when a second one opens.
+    fn update_path_idle_timeouts(&mut self, conn: &noq::Connection) {
+        let open: Vec<_> = self
+            .paths
+            .iter()
+            .filter(|(id, _)| !self.closing.contains(*id))
+            .map(|(id, addr)| (*id, addr.is_relay()))
+            .collect();
+        for path_id in &self.closing {
+            if let Some(path) = conn.path(*path_id) {
+                path.set_max_idle_timeout(None).ok();
+            }
+        }
+        for (path_id, is_relay) in &open {
+            let Some(path) = conn.path(*path_id) else {
+                continue;
+            };
+            let timeout = if open.len() <= 1 {
+                None
+            } else if *is_relay {
+                Some(RELAY_PATH_MAX_IDLE_TIMEOUT)
+            } else {
+                Some(self.path_idle_timeout)
+            };
+            let result = path.set_max_idle_timeout(timeout);
+            debug!(
+                conn_id = %ConnId(conn.stable_id()),
+                %path_id,
+                ?timeout,
+                ?result,
+                "set path idle timeout"
+            );
+        }
+    }
+
     /// Removes a path from this connection.
     fn remove_path(
         &mut self,
         path_id: &PathId,
         conn: &noq::Connection,
     ) -> Option<transports::FourTuple> {
+        self.closing.remove(path_id);
         let addr = self.paths.remove(path_id)?;
+        // noq keeps the path until it is drained, and it arms the idle timer again for each
+        // packet on the path or for a timeout that we set before we saw the event. The timer
+        // then fires on a path that is closed already.
+        if let Some(path) = conn.path(*path_id) {
+            path.set_max_idle_timeout(None).ok();
+        }
         self.path_state.record_abandoned(*path_id, conn);
         Some(addr)
     }

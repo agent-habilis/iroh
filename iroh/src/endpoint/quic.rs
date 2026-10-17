@@ -89,7 +89,7 @@ use crate::socket::{
 
 /// Builder for a [`QuicTransportConfig`].
 #[derive(Debug, Clone)]
-pub struct QuicTransportConfigBuilder(noq::TransportConfig);
+pub struct QuicTransportConfigBuilder(noq::TransportConfig, Duration);
 
 /// Parameters governing the core QUIC state machine
 ///
@@ -126,7 +126,7 @@ pub struct QuicTransportConfigBuilder(noq::TransportConfig);
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
-pub struct QuicTransportConfig(Arc<noq::TransportConfig>);
+pub struct QuicTransportConfig(Arc<noq::TransportConfig>, Duration);
 
 impl QuicTransportConfig {
     /// Returns a default [`QuicTransportConfigBuilder`] that allows customizing
@@ -146,6 +146,14 @@ impl QuicTransportConfig {
     pub(crate) fn to_inner_arc(&self) -> Arc<noq::TransportConfig> {
         self.0.clone()
     }
+
+    /// The idle timeout that iroh sets on the paths of a connection once it has more than one.
+    ///
+    /// iroh sets it on the paths, and not in the config of noq: noq would start the timer in
+    /// the handshake, where it cannot close a path.
+    pub(crate) fn path_idle_timeout(&self) -> Duration {
+        self.1
+    }
 }
 
 impl QuicTransportConfigBuilder {
@@ -155,16 +163,15 @@ impl QuicTransportConfigBuilder {
         // Override some transport config settings.
         cfg.keep_alive_interval(Some(HEARTBEAT_INTERVAL));
         cfg.default_path_keep_alive_interval(Some(HEARTBEAT_INTERVAL));
-        cfg.default_path_max_idle_timeout(Some(PATH_MAX_IDLE_TIMEOUT));
         cfg.max_concurrent_multipath_paths(MAX_MULTIPATH_PATHS);
         cfg.max_remote_nat_traversal_addresses(MAX_QNT_ADDRESSES);
         cfg.server_handshake_migration(true);
-        Self(cfg)
+        Self(cfg, PATH_MAX_IDLE_TIMEOUT)
     }
 
     /// Builds a [`QuicTransportConfig`] from the builder.
     pub fn build(self) -> QuicTransportConfig {
-        QuicTransportConfig(Arc::new(self.0))
+        QuicTransportConfig(Arc::new(self.0), self.1)
     }
 
     /// Maximum number of incoming bidirectional streams that may be open concurrently.
@@ -487,6 +494,10 @@ impl QuicTransportConfigBuilder {
     /// interact with the [`QuicTransportConfigBuilder::max_idle_timeout`], if the last path is
     /// abandoned the entire connection will be closed.
     ///
+    /// iroh sets the timeout on the paths of a connection after the handshake, and only while
+    /// the connection has more than one open path. A connection with one path is ended by the
+    /// connection idle timeout.
+    ///
     /// Note: values higher than `PATH_MAX_IDLE_TIMEOUT` (15 seconds) are clamped and a warning is logged.
     pub fn default_path_max_idle_timeout(mut self, timeout: Duration) -> Self {
         if timeout > PATH_MAX_IDLE_TIMEOUT {
@@ -494,11 +505,10 @@ impl QuicTransportConfigBuilder {
                 "QuicTransportConfig::default_path_max_idle must be at most {:?}, clamping",
                 PATH_MAX_IDLE_TIMEOUT
             );
-            self.0
-                .default_path_max_idle_timeout(Some(PATH_MAX_IDLE_TIMEOUT));
+            self.1 = PATH_MAX_IDLE_TIMEOUT;
             return self;
         }
-        self.0.default_path_max_idle_timeout(Some(timeout));
+        self.1 = timeout;
         self
     }
 
@@ -602,18 +612,23 @@ pub struct ServerConfigBuilder {
 // Note: used in `iroh::endpoint::connection::Incoming::accept_with`
 // This is new-typed since `noq::ServerConfig` takes a `TransportConfig`, which we new-type as a `QuicTransportConfig`
 #[derive(Debug, Clone)]
-pub struct ServerConfig(Arc<noq::ServerConfig>);
+pub struct ServerConfig(Arc<noq::ServerConfig>, Duration);
 
 impl ServerConfig {
     pub(crate) fn to_inner_arc(&self) -> Arc<noq::ServerConfig> {
         self.0.clone()
+    }
+
+    /// See [`QuicTransportConfig::path_idle_timeout`].
+    pub(crate) fn path_idle_timeout(&self) -> Duration {
+        self.1
     }
 }
 
 impl ServerConfigBuilder {
     /// Build a [`ServerConfig`] from a [`ServerConfigBuilder`].
     pub fn build(self) -> ServerConfig {
-        ServerConfig(Arc::new(self.inner))
+        ServerConfig(Arc::new(self.inner), self.transport.path_idle_timeout())
     }
 
     pub(crate) fn new(inner: noq::ServerConfig, transport: QuicTransportConfig) -> Self {
