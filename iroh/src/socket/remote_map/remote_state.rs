@@ -379,6 +379,9 @@ impl RemoteStateActor {
             RemoteStateMessage::ResolveRemote(addrs, tx) => {
                 self.state.handle_msg_resolve_remote(addrs, tx);
             }
+            RemoteStateMessage::RemoveAddrs(addrs, tx) => {
+                self.handle_msg_remove_addrs(addrs, tx);
+            }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
                 let info = RemoteInfo {
@@ -475,6 +478,28 @@ impl RemoteStateActor {
         self.trigger_holepunching();
         self.select_path();
         tx.send(path_state_receiver).ok();
+    }
+
+    /// Handles [`RemoteStateMessage::RemoveAddrs`].
+    fn handle_msg_remove_addrs(&mut self, addrs: BTreeSet<TransportAddr>, tx: oneshot::Sender<()>) {
+        let addrs: Vec<_> = to_transports_addr(self.state.endpoint_id, addrs).collect();
+        for addr in &addrs {
+            self.state.paths.remove(addr);
+        }
+        for conn_state in self.connections.values() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            for (path_id, network_path) in &conn_state.paths {
+                if addrs.contains(&network_path.remote())
+                    && let Some(path) = conn.path(*path_id)
+                {
+                    // Refused for the last path of the connection, which stays.
+                    path.close().ok();
+                }
+            }
+        }
+        tx.send(()).ok();
     }
 
     /// Handles [`RemoteStateMessage::NetworkChange`].
@@ -1304,6 +1329,10 @@ pub(crate) enum RemoteStateMessage {
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
     ),
+    /// Forgets these transport addresses of the remote, and closes the paths of the live
+    /// connections that run to them, unless one is the last path of its connection.
+    #[debug("RemoveAddrs(..)")]
+    RemoveAddrs(BTreeSet<TransportAddr>, oneshot::Sender<()>),
     /// Returns information about the remote.
     ///
     /// This currently only includes a list of all known transport addresses for the remote.

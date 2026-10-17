@@ -1204,6 +1204,23 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Takes the transport addresses of `addr` out of what the endpoint knows about the remote
+    /// `addr.id`.
+    ///
+    /// The addresses are the counterpart of [`add_endpoint_addr`](Self::add_endpoint_addr), and of
+    /// the addresses that Address Lookup found. A dial that follows does not try them, and the open
+    /// paths of the live connections to them are closed, unless one is the last path of its
+    /// connection. Nothing keeps an address from coming back: Address Lookup or a caller that adds
+    /// it again makes it known again. An address that is not known, and a remote that the endpoint
+    /// knows nothing about, are not an error.
+    pub async fn remove_endpoint_addr(&self, addr: impl Into<EndpointAddr>) {
+        if self.is_closed() {
+            return;
+        }
+        let addr: EndpointAddr = addr.into();
+        self.inner.remove_remote_addrs(addr).await;
+    }
+
     /// Accepts an incoming connection on the endpoint.
     ///
     /// Only connections with the ALPNs configured in [`Builder::alpns`] will be accepted.
@@ -4526,6 +4543,87 @@ mod tests {
         accepting.abort();
         client.close().await;
         server.close().await;
+        Ok(())
+    }
+
+    // A dial of an id tries every address that the endpoint knows for it. A listener of another
+    // identity on one of them, or one that serves another ALPN, answers the dial first and fails
+    // it as a whole. An address that the caller took out is not tried any more.
+    #[tokio::test]
+    async fn a_dial_does_not_try_an_address_that_was_removed() -> Result {
+        let local = |builder: super::Builder| {
+            builder
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .expect("valid address")
+        };
+        let target = local(Endpoint::builder(presets::Minimal).alpns(vec![TEST_ALPN.to_vec()]))
+            .bind()
+            .await?;
+        let foreign = local(Endpoint::builder(presets::Minimal).alpns(vec![b"other".to_vec()]))
+            .bind()
+            .await?;
+        let client = local(Endpoint::builder(presets::Minimal)).bind().await?;
+        // One task per dial: a dial that the client gave up must not hold back the next one.
+        let serving = tokio::spawn({
+            let target = target.clone();
+            async move {
+                while let Some(incoming) = target.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            }
+        });
+        let answering = tokio::spawn({
+            let foreign = foreign.clone();
+            async move {
+                while let Some(incoming) = foreign.accept().await {
+                    let _ = incoming.accept();
+                }
+            }
+        });
+        let udp_port = |endpoint: &Endpoint| {
+            endpoint
+                .bound_sockets()
+                .into_iter()
+                .find(|addr| addr.is_ipv4())
+                .expect("an IPv4 socket")
+        };
+        let foreign_addr = udp_port(&foreign);
+        let addr = EndpointAddr::new(target.id())
+            .with_ip_addr(foreign_addr)
+            .with_ip_addr(udp_port(&target));
+
+        // The dials that learn both addresses. Some of them fail, and which ones does not matter.
+        for _ in 0..3 {
+            let _ = time::timeout(
+                Duration::from_secs(3),
+                client.connect(addr.clone(), TEST_ALPN),
+            )
+            .await;
+        }
+        client
+            .remove_endpoint_addr(EndpointAddr::new(target.id()).with_ip_addr(foreign_addr))
+            .await;
+
+        for attempt in 0..6 {
+            let conn = time::timeout(
+                Duration::from_secs(3),
+                client.connect(EndpointAddr::new(target.id()), TEST_ALPN),
+            )
+            .await
+            .std_context("the dial timed out")?
+            .std_context(format!("dial {attempt} after the removal failed"))?;
+            conn.close(0u8.into(), b"");
+        }
+        serving.abort();
+        answering.abort();
+        client.close().await;
+        foreign.close().await;
+        target.close().await;
         Ok(())
     }
 

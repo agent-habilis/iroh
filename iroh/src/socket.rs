@@ -1361,6 +1361,22 @@ impl EndpointInner {
         rx.await.ok()
     }
 
+    /// Forgets the addresses of `addr` for the remote `addr.id`. Does nothing if no actor runs for
+    /// the remote.
+    pub(crate) async fn remove_remote_addrs(&self, addr: EndpointAddr) {
+        let Some(sender) = self.remote_actors.get(&addr.id) else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if sender
+            .send(RemoteStateMessage::RemoveAddrs(addr.addrs, tx))
+            .await
+            .is_ok()
+        {
+            rx.await.ok();
+        }
+    }
+
     /// Registers the connection in the `RemoteStateActor`.
     ///
     /// The actor is responsible for holepunching and opening additional paths to this
