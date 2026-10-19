@@ -3009,7 +3009,16 @@ mod tests {
             .shutdown
             .at_endpoint_closed
             .cancel();
-        time::sleep(Duration::from_millis(500)).await;
+        // The relay actor logs this line once its relays are closed, right before it stops and
+        // drops the queue. From then on, each datagram of the sender wakes the driver.
+        time::timeout(Duration::from_secs(5), async {
+            while !logs_contain("0 active relay conns") {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        time::sleep(Duration::from_millis(200)).await;
 
         assert!(
             !logs_contain("relay_recv_channel closed"),
