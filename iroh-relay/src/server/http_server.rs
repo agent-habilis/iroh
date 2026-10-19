@@ -1047,8 +1047,6 @@ impl RelayService {
             .map_err(|_elapsed| e!(ServeConnectionError::EstablishTimeout))
             .flatten();
 
-        metrics.http_connections_closed.inc();
-
         if let Err(error) = res {
             match error {
                 ServeConnectionError::ManualAccept { source, .. }
@@ -1072,6 +1070,9 @@ impl RelayService {
                 }
             }
         }
+
+        // Counted last, so that the count says that the end of the connection is logged.
+        metrics.http_connections_closed.inc();
     }
 }
 
@@ -1353,7 +1354,9 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn a_client_that_drops_the_connection_mid_request_is_not_an_error() -> Result {
+        let metrics = Arc::new(Metrics::default());
         let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+            .metrics(metrics.clone())
             .spawn()
             .await?;
         let mut stream = tokio::net::TcpStream::connect(server.addr())
@@ -1364,7 +1367,14 @@ mod tests {
             .await
             .anyerr()?;
         drop(stream);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The server counts the connection as closed once it has logged how it ended.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.http_connections_closed.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("the server did not see the end of the connection")?;
 
         logs_assert(|lines: &[&str]| {
             if lines.iter().any(|line| {
