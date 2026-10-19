@@ -589,10 +589,11 @@ impl RouterBuilder {
 
                         let protocols = protocols.clone();
                         let endpoint = endpoint.clone();
+                        let shutdown = cancel_token.clone();
                         let token = handler_cancel_token.child_token();
                         let span = info_span!("router.accept", me=%endpoint.id().fmt_short(), remote=Empty, alpn=Empty);
                         join_set.spawn(async move {
-                            token.run_until_cancelled(handle_connection(incoming, protocols, endpoint)).await
+                            token.run_until_cancelled(handle_connection(incoming, protocols, endpoint, shutdown)).await
                         }.instrument(span));
                     },
                 }
@@ -706,6 +707,7 @@ async fn handle_connection(
     incoming: crate::endpoint::Incoming,
     protocols: Arc<ProtocolMap>,
     endpoint: Endpoint,
+    shutdown: CancellationToken,
 ) {
     let remote_addr = incoming.remote_addr();
     let mut accepting = match incoming.accept() {
@@ -743,7 +745,13 @@ async fn handle_connection(
             );
 
             if let Err(err) = handler.accept(connection).await {
-                warn!("Handling incoming connection ended with error: {err}");
+                // The shutdown tells the handlers to stop before it cancels their accept futures,
+                // so a handler can fail a connection that it took before, for example gossip with
+                // `ActorDropped`. The app asked for that end.
+                log_unless_orderly!(
+                    shutdown.is_cancelled() || endpoint.is_closed(),
+                    "Handling incoming connection ended with error: {err}"
+                );
             }
         }
         Err(err) => {
@@ -1336,6 +1344,89 @@ mod tests {
         );
         dialing.abort();
         proxy.iter().for_each(|task| task.abort());
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // A handler can fail a connection that it took before it was told to shut down: gossip answers
+    // an accept with `ActorDropped` once its actor is gone. The shutdown of the router causes that
+    // error, so the router must not warn about it.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_handler_error_that_the_shutdown_of_the_router_causes_does_not_make_it_warn() -> Result
+    {
+        #[derive(Debug, Clone, Default)]
+        struct FailsOnShutdown(Arc<tokio::sync::Notify>);
+
+        impl ProtocolHandler for FailsOnShutdown {
+            async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+                self.0.notified().await;
+                Err(AcceptError::from_err(std::io::Error::other(
+                    "the actor is gone",
+                )))
+            }
+
+            async fn shutdown(&self) {
+                self.0.notify_one();
+                // The router cancels the accept futures after this call: leave the failing accept
+                // the time to end first.
+                n0_future::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, FailsOnShutdown::default())
+            .spawn();
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let _conn = client.connect(server.addr(), ECHO_ALPN).await?;
+        n0_future::time::sleep(Duration::from_millis(200)).await;
+
+        router.shutdown().await.anyerr()?;
+
+        assert_no_warning!(
+            "Handling incoming connection ended with error",
+            "a handler error that its own shutdown caused"
+        );
+        client.close().await;
+        Ok(())
+    }
+
+    // The same error while the router runs is a fault of the handler, and the router must say so.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_handler_error_while_the_router_runs_makes_it_warn() -> Result {
+        #[derive(Debug)]
+        struct Fails;
+
+        impl ProtocolHandler for Fails {
+            async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+                Err(AcceptError::from_err(std::io::Error::other(
+                    "the handler failed",
+                )))
+            }
+        }
+
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, Fails)
+            .spawn();
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let _conn = client.connect(server.addr(), ECHO_ALPN).await?;
+        n0_future::time::sleep(Duration::from_millis(300)).await;
+
+        logs_assert(|lines: &[&str]| {
+            let warned = lines.iter().any(|line| {
+                line.contains(" WARN ")
+                    && line.contains("Handling incoming connection ended with error")
+            });
+            if warned {
+                Ok(())
+            } else {
+                Err("the router did not warn about a handler error".to_string())
+            }
+        });
         client.close().await;
         router.shutdown().await.anyerr()?;
         Ok(())
