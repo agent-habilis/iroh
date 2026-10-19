@@ -59,7 +59,7 @@ use crate::{
     Endpoint,
     endpoint::{
         Accepting, AlpnError, ConnectingError, Connection, ConnectionError, RemoteEndpointIdError,
-        quic,
+        TransportErrorCode, quic,
     },
 };
 
@@ -642,15 +642,21 @@ macro_rules! log_unless_orderly {
 /// The remote can close, or go silent. Neither is a fault of this endpoint, and it cannot act on
 /// them. All other errors need a warning, because they point to a fault or a misconfiguration:
 /// for example a bad certificate, an ALPN that the dialer and this endpoint do not agree on, or a
-/// failure of this endpoint.
+/// failure of this endpoint. A close that the remote sends with a transport error code is such a
+/// report: a TLS alert says that the remote does not trust this endpoint, so it stays a warning.
 fn is_orderly_end(err: &ConnectionError) -> bool {
-    matches!(
-        err,
+    match err {
         ConnectionError::TimedOut
-            | ConnectionError::ConnectionClosed(_)
-            | ConnectionError::ApplicationClosed(_)
-            | ConnectionError::Reset
-    )
+        | ConnectionError::ApplicationClosed(_)
+        | ConnectionError::Reset => true,
+        // `APPLICATION_ERROR` carries an application close that the remote sent before the
+        // handshake was done: a close in an Initial or a Handshake packet cannot name the app code.
+        ConnectionError::ConnectionClosed(close) => {
+            close.error_code == TransportErrorCode::NO_ERROR
+                || close.error_code == TransportErrorCode::APPLICATION_ERROR
+        }
+        _ => false,
+    }
 }
 
 /// Like [`is_orderly_end`], for the errors of the handshake that wrap a [`ConnectionError`].
@@ -1329,10 +1335,20 @@ mod tests {
     // misconfiguration.
     #[test]
     fn the_router_warns_only_for_the_ends_that_the_remote_did_not_cause() {
-        use crate::endpoint::{ApplicationClose, TransportError, TransportErrorCode};
+        use crate::endpoint::{
+            ApplicationClose, ConnectionClose, TransportError, TransportErrorCode,
+        };
 
         let alert =
             |code| ConnectionError::TransportError(TransportError::new(code, String::new()));
+        // The remote closed with a transport code, as a remote in the handshake does.
+        let closed_by_the_remote = |code| {
+            ConnectionError::ConnectionClosed(ConnectionClose {
+                error_code: code,
+                frame_type: noq_proto::MaybeFrame::None,
+                reason: Default::default(),
+            })
+        };
         for orderly in [
             ConnectionError::TimedOut,
             ConnectionError::Reset,
@@ -1340,6 +1356,9 @@ mod tests {
                 error_code: 0u8.into(),
                 reason: Default::default(),
             }),
+            closed_by_the_remote(TransportErrorCode::NO_ERROR),
+            // An application close before the handshake is done travels as this code.
+            closed_by_the_remote(TransportErrorCode::APPLICATION_ERROR),
         ] {
             assert!(is_orderly_end(&orderly), "{orderly:?} must be orderly");
         }
@@ -1353,6 +1372,10 @@ mod tests {
             alert(TransportErrorCode::crypto(42)),
             // another alert: handshake_failure
             alert(TransportErrorCode::crypto(40)),
+            // the remote reports a bad_certificate alert: it does not trust this endpoint
+            closed_by_the_remote(TransportErrorCode::crypto(42)),
+            // the remote reports a protocol violation of this endpoint
+            closed_by_the_remote(TransportErrorCode::PROTOCOL_VIOLATION),
         ] {
             assert!(
                 !is_orderly_end(&unexpected),
