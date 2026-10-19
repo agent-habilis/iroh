@@ -14,7 +14,7 @@ use n0_future::{
 use n0_watcher::Watcher as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, PollSender};
-use tracing::{Instrument, error, info_span, warn};
+use tracing::{Instrument, debug, error, info_span, warn};
 
 use super::{RecvInfo, Transmit};
 use crate::endpoint::RelayStatus;
@@ -36,6 +36,8 @@ pub(crate) struct RelayTransport {
     /// A datagram from the last poll_recv that didn't quite fit our buffers.
     pending_item: Option<RelayRecvDatagram>,
     actor_sender: mpsc::Sender<RelayActorMessage>,
+    /// Cancelled when the relay actor is told to stop. The actor drops its inbox after that.
+    actor_stop: CancellationToken,
     _actor_handle: AbortOnDropHandle<()>,
     my_relay: HomeRelayWatch,
     my_endpoint_id: EndpointId,
@@ -58,6 +60,7 @@ impl RelayTransport {
         let my_endpoint_id = config.secret_key.public();
         let my_relay = config.my_relay.clone();
 
+        let actor_stop = cancel_token.clone();
         let relay_actor = RelayActor::new(config, relay_datagram_recv_tx, cancel_token);
 
         let actor_handle = AbortOnDropHandle::new(task::spawn(
@@ -74,6 +77,7 @@ impl RelayTransport {
             relay_datagram_send_channel: relay_datagram_send_tx,
             pending_item: None,
             actor_sender,
+            actor_stop,
             _actor_handle: actor_handle,
             my_relay,
             my_endpoint_id,
@@ -191,6 +195,7 @@ impl RelayTransport {
     pub(super) fn create_network_change_sender(&self) -> RelayNetworkChangeSender {
         RelayNetworkChangeSender {
             sender: self.actor_sender.clone(),
+            actor_stop: self.actor_stop.clone(),
         }
     }
 
@@ -220,6 +225,7 @@ impl RelayTransport {
 #[derive(Debug)]
 pub(super) struct RelayNetworkChangeSender {
     sender: mpsc::Sender<RelayActorMessage>,
+    actor_stop: CancellationToken,
 }
 
 impl RelayNetworkChangeSender {
@@ -243,6 +249,11 @@ impl RelayNetworkChangeSender {
     fn send_relay_actor(&self, msg: RelayActorMessage) {
         match self.sender.try_send(msg) {
             Ok(_) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) if self.actor_stop.is_cancelled() => {
+                // The actor drops its inbox only after it was told to stop, and a net report or
+                // a network change can still arrive while the endpoint closes.
+                debug!("relay actor already stopped, dropping message");
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!("unable to send to relay actor, already closed");
             }
@@ -323,6 +334,89 @@ mod tests {
 
     use super::*;
     use crate::defaults::staging;
+
+    /// The text of the WARN events that `body` logs on this thread.
+    fn warns_during(body: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("no poison").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = sink.0.lock().expect("no poison").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn change_sender(
+        capacity: usize,
+    ) -> (RelayNetworkChangeSender, mpsc::Receiver<RelayActorMessage>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let sender = RelayNetworkChangeSender {
+            sender,
+            actor_stop: CancellationToken::new(),
+        };
+        (sender, receiver)
+    }
+
+    #[test]
+    fn a_message_to_a_relay_actor_that_was_told_to_stop_is_not_a_warning() {
+        let (sender, receiver) = change_sender(4);
+        sender.actor_stop.cancel();
+        drop(receiver);
+
+        let warns = warns_during(|| sender.rebind().expect("rebind"));
+
+        assert!(warns.is_empty(), "{warns}");
+    }
+
+    #[test]
+    fn a_message_to_a_relay_actor_that_died_while_live_is_a_warning() {
+        let (sender, receiver) = change_sender(4);
+        drop(receiver);
+
+        let warns = warns_during(|| sender.rebind().expect("rebind"));
+
+        assert!(
+            warns.contains("unable to send to relay actor, already closed"),
+            "{warns}"
+        );
+    }
+
+    #[test]
+    fn a_message_to_a_relay_actor_with_a_full_inbox_is_a_warning() {
+        let (sender, _receiver) = change_sender(1);
+        sender.actor_stop.cancel();
+
+        let warns = warns_during(|| {
+            sender.rebind().expect("rebind");
+            sender.rebind().expect("rebind");
+        });
+
+        assert!(
+            warns.contains("dropping message for relay actor, channel is full"),
+            "{warns}"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_relay_datagram_queue() {
