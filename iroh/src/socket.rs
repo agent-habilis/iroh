@@ -1430,6 +1430,11 @@ enum ActorMessage {
     DirectAddrRefresh,
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
+    /// A message whose handler waits until the sender is dropped: a stand-in for a handler that
+    /// waits on a remote actor.
+    #[cfg(all(test, with_crypto_provider))]
+    #[debug("Block(..)")]
+    Block(oneshot::Receiver<()>),
 }
 
 /// State for polling until a default route is available after a network change.
@@ -1567,7 +1572,15 @@ impl Actor {
 
                     trace!(?msg, "tick: msg");
                     self.sock.metrics.socket.actor_tick_msg.inc();
-                    self.handle_actor_message(msg).await;
+                    // A handler can wait on a remote actor, and the close stops that actor as
+                    // well. Drop the handler then, so that `close` does not wait for it.
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => {
+                            debug!("tick: shutting down in a message");
+                            return;
+                        }
+                        _ = self.handle_actor_message(msg) => {}
+                    }
                 }
                 tick = self.periodic_re_stun_timer.tick() => {
                     trace!("tick: re_stun {:?}", tick);
@@ -1835,6 +1848,10 @@ impl Actor {
             #[cfg(all(test, with_crypto_provider))]
             ActorMessage::ForceNetworkChange(is_major) => {
                 self.handle_network_change(is_major);
+            }
+            #[cfg(all(test, with_crypto_provider))]
+            ActorMessage::Block(release) => {
+                release.await.ok();
             }
         }
     }
@@ -3028,6 +3045,69 @@ mod tests {
         accepting.abort();
         closing.close().await;
         sender.close().await;
+        Ok(())
+    }
+
+    // The handler of a message can wait on a remote actor, and that actor stops at the close as
+    // well. The actor of the socket must still end within the budget of `close` and not make it
+    // log that its tasks did not finish.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_actor_that_waits_in_a_message_does_not_hold_the_close_back() -> Result {
+        let ep = Endpoint::builder(presets::Minimal).bind().await?;
+        let (_held, release) = tokio::sync::oneshot::channel();
+        ep.inner()
+            .anyerr()?
+            .actor_sender
+            .send(super::ActorMessage::Block(release))
+            .await
+            .anyerr()?;
+        time::sleep(Duration::from_millis(50)).await;
+
+        ep.close().await;
+
+        assert!(
+            !logs_contain("tasks didn't finish in time"),
+            "the close waited for an actor that was in the middle of a message"
+        );
+        Ok(())
+    }
+
+    // A caller that waits for the actor when the close starts gets an error, not a panic: the
+    // actor drops the sender of its reply.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_caller_that_waits_for_the_actor_at_the_close_gets_an_error() -> Result {
+        let ep = Endpoint::builder(presets::Minimal).bind().await?;
+        let (_held, release) = tokio::sync::oneshot::channel();
+        let inner = ep.inner().anyerr()?;
+        inner
+            .actor_sender
+            .send(super::ActorMessage::Block(release))
+            .await
+            .anyerr()?;
+        let remote = SecretKey::generate().public();
+        let waiting = tokio::spawn({
+            let ep = ep.clone();
+            async move {
+                ep.inner()
+                    .expect("the endpoint is open")
+                    .resolve_remote(EndpointAddr::new(remote))
+                    .await
+            }
+        });
+        time::sleep(Duration::from_millis(50)).await;
+
+        ep.close().await;
+
+        let reply = time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .anyerr()?
+            .anyerr()?;
+        assert!(
+            reply.is_err(),
+            "the caller gets the error of a stopped actor"
+        );
         Ok(())
     }
 }
