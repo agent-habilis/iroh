@@ -671,23 +671,35 @@ fn is_orderly_accept_end(err: &AcceptError) -> bool {
     }
 }
 
+/// Like [`is_orderly_end`], for the error of the read of the ALPN of the handshake. The close of
+/// this endpoint ends that read too, see [`is_endpoint_closed_end`].
+fn is_orderly_alpn_end(err: &AlpnError, endpoint: &Endpoint) -> bool {
+    match err {
+        AlpnError::ConnectionError { source, .. } => {
+            is_orderly_end(source) || is_own_close(source, endpoint)
+        }
+        _ => false,
+    }
+}
+
 /// Whether the end of the handshake is the close of this endpoint, which has started. The app
 /// closed it on purpose, and the handshake task sees the close a moment before the router cancels
 /// it.
 fn is_endpoint_closed_end(err: &AcceptError, endpoint: &Endpoint) -> bool {
-    matches!(
-        err,
+    match err {
         AcceptError::Connecting {
-            source: ConnectingError::ConnectionError {
-                source: ConnectionError::LocallyClosed,
-                ..
-            },
-            ..
-        } | AcceptError::Connection {
-            source: ConnectionError::LocallyClosed,
+            source: ConnectingError::ConnectionError { source, .. },
             ..
         }
-    ) && n0_future::future::now_or_never(endpoint.closed()).is_some()
+        | AcceptError::Connection { source, .. } => is_own_close(source, endpoint),
+        _ => false,
+    }
+}
+
+/// Whether `err` is the close of `endpoint`, which has started.
+fn is_own_close(err: &ConnectionError, endpoint: &Endpoint) -> bool {
+    matches!(err, ConnectionError::LocallyClosed)
+        && n0_future::future::now_or_never(endpoint.closed()).is_some()
 }
 
 async fn handle_connection(
@@ -710,11 +722,10 @@ async fn handle_connection(
     let alpn = match accepting.alpn().await {
         Ok(alpn) => alpn,
         Err(err) => {
-            let orderly = matches!(
-                &err,
-                AlpnError::ConnectionError { source, .. } if is_orderly_end(source)
+            log_unless_orderly!(
+                is_orderly_alpn_end(&err, &endpoint),
+                "Ignoring connection: invalid handshake: {err:#}"
             );
-            log_unless_orderly!(orderly, "Ignoring connection: invalid handshake: {err:#}");
             return;
         }
     };
@@ -1327,6 +1338,42 @@ mod tests {
         proxy.iter().for_each(|task| task.abort());
         client.close().await;
         router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // The app can close the endpoint while the ALPN of a handshake is still to come: the
+    // ClientHello of a dialer spans two Initial packets, and the second is still in flight. The
+    // read of the ALPN then ends with `LocallyClosed`. The endpoint was closed on purpose, so
+    // the router must not warn about it, as it does not for a handshake that the close ends.
+    #[tokio::test]
+    async fn the_alpn_read_that_the_close_of_the_endpoint_ends_is_orderly() -> Result {
+        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let locally_closed = || {
+            e!(AlpnError::ConnectionError {
+                source: ConnectionError::LocallyClosed
+            })
+        };
+        assert!(
+            !is_orderly_alpn_end(&locally_closed(), &endpoint),
+            "an endpoint that is open did not end the read: that is a fault"
+        );
+
+        endpoint.close().await;
+
+        assert!(is_orderly_alpn_end(&locally_closed(), &endpoint));
+        assert!(
+            is_orderly_alpn_end(
+                &e!(AlpnError::ConnectionError {
+                    source: ConnectionError::TimedOut
+                }),
+                &endpoint
+            ),
+            "a dialer that went silent is orderly as before"
+        );
+        assert!(
+            !is_orderly_alpn_end(&e!(AlpnError::Unavailable), &endpoint),
+            "a handshake without an ALPN stays a warning"
+        );
         Ok(())
     }
 
