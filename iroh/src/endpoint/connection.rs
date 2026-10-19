@@ -423,7 +423,7 @@ pub struct Connecting {
     #[debug("{}", register_with_socket.as_ref().map(|_| "Some(RegisterWithSocketFut)").unwrap_or("None"))]
     register_with_socket: Option<RegisterWithSocketFut>,
     ep: Endpoint,
-    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`].
+    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`](super::QuicTransportConfig).
     path_idle_timeout: Duration,
     /// `Some(remote_id)` if this is an outgoing connection, `None` if this is an incoming conn
     remote_endpoint_id: EndpointId,
@@ -442,7 +442,7 @@ pub struct Accepting {
     #[debug("{}", register_with_socket.as_ref().map(|_| "Some(RegisterWithSocketFut)").unwrap_or("None"))]
     register_with_socket: Option<RegisterWithSocketFut>,
     ep: Endpoint,
-    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`].
+    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`](super::QuicTransportConfig).
     path_idle_timeout: Duration,
 }
 

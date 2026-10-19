@@ -1535,7 +1535,7 @@ impl<'a> PathSelectionContext<'a> {
     ///
     /// The same address may appear more than once when it is a path on multiple
     /// connections to the remote.  Selectors that care should aggregate as appropriate.
-    /// A path that this endpoint has closed is not a candidate, see [`ConnectionState::closing`].
+    /// A path that this endpoint has closed is not a candidate, see `ConnectionState::closing`.
     pub fn paths(&self) -> Box<dyn Iterator<Item = PathSelectionData<'a>> + '_> {
         match &self.source {
             PathsSource::Live(connections) => Box::new(
