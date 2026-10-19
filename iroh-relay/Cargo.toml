@@ -46,8 +46,8 @@ postcard = { version = "1", default-features = false, features = [
     "use-std",
     "experimental-derive",
 ] }
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "d4eb781fece74c6f2c4f3265db2a6dd40a6dd7fd", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "d4eb781fece74c6f2c4f3265db2a6dd40a6dd7fd", default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2b2252ce483cd9a5f88296fa7989bc54324a0bdf", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2b2252ce483cd9a5f88296fa7989bc54324a0bdf", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.33", default-features = false }
