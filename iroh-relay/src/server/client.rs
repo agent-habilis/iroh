@@ -268,6 +268,36 @@ pub enum RunError {
     TickFlush {},
 }
 
+/// Whether the error says that the client went away: its connection reset, broke, or ended in the
+/// middle of a frame. The client chose to leave or died, and the relay can do nothing about it, so
+/// the exit of its actor is not a fault of the relay. Every other error stays a warning.
+fn client_went_away(error: &RunError) -> bool {
+    use std::io::ErrorKind;
+
+    use n0_error::StackError as _;
+
+    error.stack().any(|source| {
+        // The io error of the socket sits inside an `AnyError`, which a plain downcast of the
+        // chain does not open.
+        source
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| {
+                source
+                    .downcast_ref::<n0_error::AnyError>()
+                    .and_then(|any| any.downcast_ref::<std::io::Error>())
+            })
+            .is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                )
+            })
+    })
+}
+
 /// Manages all the reads and writes to this client. It periodically sends a `KEEP_ALIVE`
 /// message to the client to keep the connection alive.
 ///
@@ -320,6 +350,9 @@ where
             self.metrics.unique_client_keys.inc();
         }
         match self.run_inner(done).await {
+            Err(e) if client_went_away(&e) => {
+                debug!("client went away: {e:#}, exiting");
+            }
             Err(e) => {
                 warn!("actor errored {e:#}, exiting");
             }
@@ -858,5 +891,122 @@ mod tests {
         assert_eq!(recv_frame, frame);
 
         Ok(())
+    }
+
+    /// A stream that fails its first read with `error`, as the socket of a client that is gone
+    /// does, and ends after it.
+    struct FailsOnRead(Option<std::io::Error>);
+
+    impl Stream for FailsOnRead {
+        type Item = Result<bytes::Bytes, crate::protos::streams::StreamError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(
+                self.0
+                    .take()
+                    // The stream of the server reports the error of its WebSocket, which holds the io
+                    // error of the socket.
+                    .map(|error| {
+                        Err(n0_error::AnyError::from_std(tokio_websockets::Error::Io(
+                            error,
+                        )))
+                    }),
+            )
+        }
+    }
+
+    impl n0_future::Sink<bytes::Bytes> for FailsOnRead {
+        type Error = crate::protos::streams::StreamError;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: bytes::Bytes,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Runs the actor of a client whose stream fails its first read with `error`, until it exits.
+    async fn run_client_whose_read_fails(error: std::io::Error) {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let (_send_queue_s, send_queue_r) = mpsc::channel(10);
+        let (_message_s, message_r) = mpsc::channel(10);
+        let endpoint_id = SecretKey::from_bytes(&rng.random()).public();
+        let actor = Actor {
+            stream: RelayedStream::new(FailsOnRead(Some(error)), crate::KeyCache::test()),
+            timeout: Duration::from_secs(1),
+            packet_send_queue: send_queue_r,
+            message_send_queue: message_r,
+            guard: OnDisconnectGuard::empty(endpoint_id),
+            clients: Clients::default(),
+            client_counter: ClientCounter::default(),
+            ping_tracker: PingTracker::default(),
+            metrics: Arc::new(Metrics::default()),
+        };
+        actor.run(CancellationToken::new()).await;
+    }
+
+    /// A client that resets, breaks or cuts its connection went away. It chose to, or it died, and
+    /// the relay can do nothing about it, so the exit of its actor is not a warning.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_client_that_resets_its_connection_is_not_a_warning() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            run_client_whose_read_fails(std::io::Error::from(kind)).await;
+        }
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .find(|line| line.contains(" WARN ") && line.contains("actor errored"))
+            {
+                Some(line) => Err(format!("a client that went away is a warning: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
+
+    /// Any other error of the stream is a fault that the relay must say.
+    #[tokio::test]
+    #[traced_test]
+    async fn another_error_of_the_stream_stays_a_warning() {
+        run_client_whose_read_fails(std::io::Error::other("a corrupt frame")).await;
+        logs_assert(|lines: &[&str]| {
+            if lines
+                .iter()
+                .any(|line| line.contains(" WARN ") && line.contains("actor errored"))
+            {
+                Ok(())
+            } else {
+                Err("an error of the stream was not logged as a warning".to_owned())
+            }
+        });
     }
 }
