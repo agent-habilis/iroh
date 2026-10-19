@@ -1194,6 +1194,12 @@ impl Connection<HandshakeCompleted> {
         self.inner.side()
     }
 
+    /// The noq connection, for the tests of the socket.
+    #[cfg(all(test, with_crypto_provider))]
+    pub(crate) fn noq_connection(&self) -> &noq::Connection {
+        &self.inner
+    }
+
     /// Returns a [`WeakConnectionHandle`] for this connection.
     ///
     /// A [`WeakConnectionHandle`] does not keep the connection alive. It can be used to

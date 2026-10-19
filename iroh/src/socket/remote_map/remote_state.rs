@@ -1535,6 +1535,7 @@ impl<'a> PathSelectionContext<'a> {
     ///
     /// The same address may appear more than once when it is a path on multiple
     /// connections to the remote.  Selectors that care should aggregate as appropriate.
+    /// A path that this endpoint has closed is not a candidate, see [`ConnectionState::closing`].
     pub fn paths(&self) -> Box<dyn Iterator<Item = PathSelectionData<'a>> + '_> {
         match &self.source {
             PathsSource::Live(connections) => Box::new(
@@ -1542,9 +1543,13 @@ impl<'a> PathSelectionContext<'a> {
                     .values()
                     .filter_map(|state| state.handle.upgrade().map(|conn| (state, conn)))
                     .flat_map(|(state, conn)| {
-                        state.paths.iter().map(move |(path_id, addr)| {
-                            PathSelectionData::live(addr, *path_id, conn.clone())
-                        })
+                        state
+                            .paths
+                            .iter()
+                            .filter(|(path_id, _)| !state.closing.contains(*path_id))
+                            .map(move |(path_id, addr)| {
+                                PathSelectionData::live(addr, *path_id, conn.clone())
+                            })
                     }),
             ),
             #[cfg(any(test, feature = "selector-test-utils"))]
@@ -1785,6 +1790,69 @@ mod tests {
                 queue_open_retry(queue, &addr);
             }
         }
+    }
+
+    // A path that this endpoint closed stays in `paths` until noq reports it abandoned. It is
+    // not open, so the selector must not see it: a selector that picks it selects a path that
+    // is gone, and `open_path_on_conn` takes the path for open and opens nothing.
+    #[cfg(with_crypto_provider)]
+    #[tokio::test]
+    async fn a_path_that_is_closing_is_not_offered_to_the_selector() -> n0_error::Result {
+        use crate::endpoint::presets;
+
+        const ALPN: &[u8] = b"/iroh/test/closing-path";
+        let server = crate::Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let client = crate::Endpoint::bind(presets::Minimal).await?;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .accept()
+                    .await
+                    .expect("an incoming connection")
+                    .await
+                    .expect("the handshake")
+            }
+        });
+        let conn = client.connect(server.addr(), ALPN).await?;
+        let noq_conn = conn.noq_connection().clone();
+        let (path_state, _path_state_receiver) = PathStateSender::new();
+        let open = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            4000,
+        ))));
+        let closing = transports::FourTuple::from_remote(transports::Addr::from(SocketAddr::from(
+            (Ipv4Addr::LOCALHOST, 4001),
+        )));
+        let mut state = ConnectionState {
+            handle: noq_conn.weak_handle(),
+            path_state,
+            paths: Default::default(),
+            closing: Default::default(),
+            path_idle_timeout: Duration::from_secs(15),
+            has_been_direct: false,
+        };
+        state.paths.insert(PathId::ZERO, open.clone());
+        state.paths.insert(PathId::MAX, closing);
+        state.closing.insert(PathId::MAX);
+        let mut connections = FxHashMap::default();
+        connections.insert(ConnId(noq_conn.stable_id()), state);
+
+        let offered: Vec<_> = PathSelectionContext::new(None, &connections)
+            .paths()
+            .map(|path| path.network_path().clone())
+            .collect();
+
+        assert_eq!(offered, vec![open]);
+        drop(connections);
+        conn.close(0u32.into(), b"done");
+        let _ = accepting.await;
+        client.close().await;
+        server.close().await;
+        Ok(())
     }
 
     // A pair on an IP path queues no learned custom address. The addresses must be queued
