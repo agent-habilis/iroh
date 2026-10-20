@@ -30,4 +30,5 @@ ignore = [
 [sources]
 allow-git = [
   "https://github.com/agent-habilis/net-tools", # netwatch + portmapper fork pin
+  "https://github.com/agent-habilis/noq", # noq and noq-proto fork pin
 ]
