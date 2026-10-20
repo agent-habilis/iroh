@@ -643,8 +643,10 @@ macro_rules! log_unless_orderly {
 /// The remote can close, or go silent. Neither is a fault of this endpoint, and it cannot act on
 /// them. All other errors need a warning, because they point to a fault or a misconfiguration:
 /// for example a bad certificate, an ALPN that the dialer and this endpoint do not agree on, or a
-/// failure of this endpoint. A close that the remote sends with a transport error code is such a
-/// report: a TLS alert says that the remote does not trust this endpoint, so it stays a warning.
+/// failure of this endpoint. A close that the remote sends with a transport error code is a
+/// report of a fault of this endpoint, so it stays a warning. A TLS alert from the remote is not:
+/// the remote chose not to trust this endpoint, as a probe of another mesh on a shared port does,
+/// and this endpoint cannot act on that choice.
 fn is_orderly_end(err: &ConnectionError) -> bool {
     match err {
         ConnectionError::TimedOut
@@ -655,9 +657,15 @@ fn is_orderly_end(err: &ConnectionError) -> bool {
         ConnectionError::ConnectionClosed(close) => {
             close.error_code == TransportErrorCode::NO_ERROR
                 || close.error_code == TransportErrorCode::APPLICATION_ERROR
+                || is_tls_alert(close.error_code)
         }
         _ => false,
     }
+}
+
+/// Whether a transport error code carries a TLS alert, see RFC 9001 section 4.8.
+fn is_tls_alert(code: TransportErrorCode) -> bool {
+    (0x100..=0x1ff).contains(&u64::from(code))
 }
 
 /// Like [`is_orderly_end`], for the errors of the handshake that wrap a [`ConnectionError`].
@@ -1497,6 +1505,10 @@ mod tests {
             closed_by_the_remote(TransportErrorCode::NO_ERROR),
             // An application close before the handshake is done travels as this code.
             closed_by_the_remote(TransportErrorCode::APPLICATION_ERROR),
+            // The remote does not trust this endpoint: a bad_certificate or an unknown_ca alert.
+            // A probe of another mesh on a shared port ladder does that by design.
+            closed_by_the_remote(TransportErrorCode::crypto(42)),
+            closed_by_the_remote(TransportErrorCode::crypto(48)),
         ] {
             assert!(is_orderly_end(&orderly), "{orderly:?} must be orderly");
         }
@@ -1510,10 +1522,9 @@ mod tests {
             alert(TransportErrorCode::crypto(42)),
             // another alert: handshake_failure
             alert(TransportErrorCode::crypto(40)),
-            // the remote reports a bad_certificate alert: it does not trust this endpoint
-            closed_by_the_remote(TransportErrorCode::crypto(42)),
-            // the remote reports a protocol violation of this endpoint
+            // the remote reports a fault of this endpoint
             closed_by_the_remote(TransportErrorCode::PROTOCOL_VIOLATION),
+            closed_by_the_remote(TransportErrorCode::FLOW_CONTROL_ERROR),
         ] {
             assert!(
                 !is_orderly_end(&unexpected),
