@@ -320,6 +320,14 @@ impl ShutdownState {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
+
+    /// Whether the endpoint is drained and its actors are stopping.
+    ///
+    /// The actors of the transports stop, and their queues close, before [`Self::is_closed`]
+    /// is set.
+    fn is_drained(&self) -> bool {
+        self.at_endpoint_closed.is_cancelled()
+    }
 }
 
 /// Iroh connectivity layer.
@@ -405,6 +413,11 @@ impl Socket {
     /// Whether [`crate::Endpoint::close`] has been called.
     fn is_closing(&self) -> bool {
         self.shutdown.is_closing()
+    }
+
+    /// Whether the endpoint is drained and its actors are stopping.
+    pub(crate) fn is_drained(&self) -> bool {
+        self.shutdown.is_drained()
     }
 
     /// Returns a future that resolves once endpoint shutdown has started.
@@ -1348,6 +1361,22 @@ impl EndpointInner {
         rx.await.ok()
     }
 
+    /// Forgets the addresses of `addr` for the remote `addr.id`. Does nothing if no actor runs for
+    /// the remote.
+    pub(crate) async fn remove_remote_addrs(&self, addr: EndpointAddr) {
+        let Some(sender) = self.remote_actors.get(&addr.id) else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if sender
+            .send(RemoteStateMessage::RemoveAddrs(addr.addrs, tx))
+            .await
+            .is_ok()
+        {
+            rx.await.ok();
+        }
+    }
+
     /// Registers the connection in the `RemoteStateActor`.
     ///
     /// The actor is responsible for holepunching and opening additional paths to this
@@ -1360,13 +1389,19 @@ impl EndpointInner {
         &self,
         remote: EndpointId,
         conn: noq::Connection,
+        path_idle_timeout: Duration,
     ) -> impl Future<Output = Result<PathStateReceiver, RemoteStateActorStoppedError>> + Send + 'static
     {
         let (tx, rx) = oneshot::channel();
         let sender = self.actor_sender.clone();
         async move {
             sender
-                .send(ActorMessage::AddConnection(remote, conn, tx))
+                .send(ActorMessage::AddConnection(
+                    remote,
+                    conn,
+                    path_idle_timeout,
+                    tx,
+                ))
                 .await
                 .map_err(|_| RemoteStateActorStoppedError::new())?;
             rx.await.map_err(|_| RemoteStateActorStoppedError::new())
@@ -1388,12 +1423,18 @@ enum ActorMessage {
     AddConnection(
         EndpointId,
         noq::Connection,
+        Duration,
         oneshot::Sender<PathStateReceiver>,
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
     DirectAddrRefresh,
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
+    /// A message whose handler waits until the sender is dropped: a stand-in for a handler that
+    /// waits on a remote actor.
+    #[cfg(all(test, with_crypto_provider))]
+    #[debug("Block(..)")]
+    Block(oneshot::Receiver<()>),
 }
 
 /// State for polling until a default route is available after a network change.
@@ -1531,7 +1572,15 @@ impl Actor {
 
                     trace!(?msg, "tick: msg");
                     self.sock.metrics.socket.actor_tick_msg.inc();
-                    self.handle_actor_message(msg).await;
+                    // A handler can wait on a remote actor, and the close stops that actor as
+                    // well. Drop the handler then, so that `close` does not wait for it.
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => {
+                            debug!("tick: shutting down in a message");
+                            return;
+                        }
+                        _ = self.handle_actor_message(msg) => {}
+                    }
                 }
                 tick = self.periodic_re_stun_timer.tick() => {
                     trace!("tick: re_stun {:?}", tick);
@@ -1784,8 +1833,10 @@ impl Actor {
             ActorMessage::ResolveRemote(addr, tx) => {
                 self.remote_map.resolve_remote(addr, tx).await;
             }
-            ActorMessage::AddConnection(remote, conn, tx) => {
-                self.remote_map.add_connection(remote, conn, tx).await;
+            ActorMessage::AddConnection(remote, conn, path_idle_timeout, tx) => {
+                self.remote_map
+                    .add_connection(remote, conn, path_idle_timeout, tx)
+                    .await;
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]
@@ -1797,6 +1848,10 @@ impl Actor {
             #[cfg(all(test, with_crypto_provider))]
             ActorMessage::ForceNetworkChange(is_major) => {
                 self.handle_network_change(is_major);
+            }
+            #[cfg(all(test, with_crypto_provider))]
+            ActorMessage::Block(release) => {
+                release.await.ok();
             }
         }
     }
@@ -2909,5 +2964,150 @@ mod tests {
 
         // TODO: could remove the addresses again, send, add it back and see it recover.
         // But we don't have that much private access to the RemoteMap.  This will do for now.
+    }
+
+    // `Socket::close` cancels `at_endpoint_closed` once the drain is done. That stops the relay
+    // actor, which drops the queue of received datagrams. The socket is marked closed only
+    // after the tasks stopped, and until then peers that still send over the relay wake the
+    // driver of noq, which polls a closed queue and logs an error. This holds the socket in
+    // that state, so that the window is not a matter of microseconds.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_drained_socket_does_not_poll_a_closed_relay_queue() -> Result {
+        use crate::{RelayMode, test_utils::run_relay_server};
+
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let bind = || {
+            let relay_map = relay_map.clone();
+            async move {
+                let ep = Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Custom(relay_map))
+                    .alpns(vec![ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .bind()
+                    .await?;
+                ep.online().await;
+                Ok::<_, n0_error::AnyError>(ep)
+            }
+        };
+        let (closing, sender) = (bind().await?, bind().await?);
+        let accepting = tokio::spawn({
+            let closing = closing.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = closing.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let full = closing.addr();
+        let relay_only = EndpointAddr::new(full.id).with_addrs(
+            full.relay_urls()
+                .map(|url| TransportAddr::Relay(url.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let conn = sender.connect(relay_only, ALPN).await?;
+        let sending = tokio::spawn(async move {
+            while conn
+                .send_datagram(bytes::Bytes::from_static(&[7; 200]))
+                .is_ok()
+            {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        time::sleep(Duration::from_millis(200)).await;
+
+        // The drain is done: the socket does the next step of `close` and stays there.
+        closing
+            .inner()
+            .anyerr()?
+            .shutdown
+            .at_endpoint_closed
+            .cancel();
+        // The relay actor logs this line once its relays are closed, right before it stops and
+        // drops the queue. From then on, each datagram of the sender wakes the driver.
+        time::timeout(Duration::from_secs(5), async {
+            while !logs_contain("0 active relay conns") {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !logs_contain("relay_recv_channel closed"),
+            "the relay transport was polled after its queue closed"
+        );
+        sending.abort();
+        accepting.abort();
+        closing.close().await;
+        sender.close().await;
+        Ok(())
+    }
+
+    // The handler of a message can wait on a remote actor, and that actor stops at the close as
+    // well. The actor of the socket must still end within the budget of `close` and not make it
+    // log that its tasks did not finish.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_actor_that_waits_in_a_message_does_not_hold_the_close_back() -> Result {
+        let ep = Endpoint::builder(presets::Minimal).bind().await?;
+        let (_held, release) = tokio::sync::oneshot::channel();
+        ep.inner()
+            .anyerr()?
+            .actor_sender
+            .send(super::ActorMessage::Block(release))
+            .await
+            .anyerr()?;
+        time::sleep(Duration::from_millis(50)).await;
+
+        ep.close().await;
+
+        assert!(
+            !logs_contain("tasks didn't finish in time"),
+            "the close waited for an actor that was in the middle of a message"
+        );
+        Ok(())
+    }
+
+    // A caller that waits for the actor when the close starts gets an error, not a panic: the
+    // actor drops the sender of its reply.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_caller_that_waits_for_the_actor_at_the_close_gets_an_error() -> Result {
+        let ep = Endpoint::builder(presets::Minimal).bind().await?;
+        let (_held, release) = tokio::sync::oneshot::channel();
+        let inner = ep.inner().anyerr()?;
+        inner
+            .actor_sender
+            .send(super::ActorMessage::Block(release))
+            .await
+            .anyerr()?;
+        let remote = SecretKey::generate().public();
+        let waiting = tokio::spawn({
+            let ep = ep.clone();
+            async move {
+                ep.inner()
+                    .expect("the endpoint is open")
+                    .resolve_remote(EndpointAddr::new(remote))
+                    .await
+            }
+        });
+        time::sleep(Duration::from_millis(50)).await;
+
+        ep.close().await;
+
+        let reply = time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .anyerr()?
+            .anyerr()?;
+        assert!(
+            reply.is_err(),
+            "the caller gets the error of a stopped actor"
+        );
+        Ok(())
     }
 }

@@ -1151,8 +1151,9 @@ impl Endpoint {
 
         let transport_config = options
             .transport_config
-            .map(|cfg| cfg.to_inner_arc())
-            .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
+            .unwrap_or_else(|| self.inner.static_config.transport_config.clone());
+        let path_idle_timeout = transport_config.path_idle_timeout();
+        let transport_config = transport_config.to_inner_arc();
 
         // Start connecting via noq. This will time out after 10 seconds if no reachable
         // address is available.
@@ -1171,7 +1172,12 @@ impl Endpoint {
                 .noq_endpoint()
                 .connect_with(client_config, dest_addr, server_name)?;
 
-        Ok(Connecting::new(connect, self.clone(), endpoint_id))
+        Ok(Connecting::new(
+            connect,
+            self.clone(),
+            endpoint_id,
+            path_idle_timeout,
+        ))
     }
 
     /// Gives this endpoint an address of a remote, without dialing it.
@@ -1196,6 +1202,23 @@ impl Endpoint {
         ensure!(addr.id != self.id(), AddEndpointAddrError::SelfAddress);
         self.inner.resolve_remote(addr).await??;
         Ok(())
+    }
+
+    /// Takes the transport addresses of `addr` out of what the endpoint knows about the remote
+    /// `addr.id`.
+    ///
+    /// The addresses are the counterpart of [`add_endpoint_addr`](Self::add_endpoint_addr), and of
+    /// the addresses that Address Lookup found. A dial that follows does not try them, and the open
+    /// paths of the live connections to them are closed, unless one is the last path of its
+    /// connection. Nothing keeps an address from coming back: Address Lookup or a caller that adds
+    /// it again makes it known again. An address that is not known, and a remote that the endpoint
+    /// knows nothing about, are not an error.
+    pub async fn remove_endpoint_addr(&self, addr: impl Into<EndpointAddr>) {
+        if self.is_closed() {
+            return;
+        }
+        let addr: EndpointAddr = addr.into();
+        self.inner.remove_remote_addrs(addr).await;
     }
 
     /// Accepts an incoming connection on the endpoint.
@@ -1792,6 +1815,14 @@ impl Endpoint {
     }
 
     // # Remaining private methods
+
+    /// The idle timeout of the paths of a connection that has no config of its own.
+    pub(crate) fn path_idle_timeout(&self) -> std::time::Duration {
+        self.inner
+            .static_config
+            .transport_config
+            .path_idle_timeout()
+    }
 
     /// Translates a raw [`SocketAddr`] (which may be a synthetic mapped address) into
     /// a transport address.
@@ -4320,6 +4351,559 @@ mod tests {
             .await
             .std_context("waiting for endpoint to come online")?;
 
+        Ok(())
+    }
+
+    /// Moves the selection to another IP path at every call.
+    #[cfg(feature = "unstable-custom-transports")]
+    #[derive(Debug, Default)]
+    struct Flip(std::sync::atomic::AtomicUsize);
+
+    #[cfg(feature = "unstable-custom-transports")]
+    impl crate::endpoint::transports::PathSelector for Flip {
+        fn select(
+            &self,
+            ctx: &crate::endpoint::transports::PathSelectionContext<'_>,
+        ) -> crate::endpoint::transports::PathSelection {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut selection = crate::endpoint::transports::PathSelection::none();
+            let ips: Vec<_> = ctx.paths().filter(|p| p.network_path().is_ip()).collect();
+            if !ips.is_empty() {
+                selection.set(&ips[n % ips.len()]);
+            }
+            selection
+        }
+    }
+
+    // The selected path is one per remote, and the client applies it to every connection of
+    // that remote. A connection that has closed an IP path still counts it until noq reports
+    // it abandoned. When the selector moves to that closing path, the client closes the one
+    // IP path that is still open on the connection, and noq refuses with `LastOpenPath`.
+    //
+    // Needs a host with two or more local IP addresses to open two IP paths per connection.
+    // On a host with one address the test passes without a check.
+    #[cfg(feature = "unstable-custom-transports")]
+    #[tokio::test]
+    #[traced_test]
+    async fn a_moving_selection_does_not_close_the_last_open_ip_path() -> Result {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .path_selector(Arc::new(Flip::default()))
+            .bind()
+            .await?;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+
+        let mut conns = Vec::new();
+        for _ in 0..6 {
+            conns.push(client.connect(server.addr(), TEST_ALPN).await?);
+        }
+        time::sleep(Duration::from_secs(2)).await;
+        for conn in conns {
+            conn.close(0u8.into(), b"");
+        }
+
+        assert!(
+            !logs_contain("could not close last open path"),
+            "the client tried to close the last open path"
+        );
+        client.close().await;
+        server.close().await;
+        accepting.abort();
+        Ok(())
+    }
+
+    // A client that closes its endpoint ends its relay connection. The relay server sees the
+    // end of the stream. It is a normal end, and the server must not log it as a warning.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_client_that_closes_cleanly_does_not_make_the_relay_server_warn() -> Result {
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        for _ in 0..5 {
+            let client = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Custom(relay_map.clone()))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .bind()
+                .await?;
+            client.online().await;
+            client.close().await;
+        }
+        time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !logs_contain("actor errored"),
+            "the relay server warned about a clean close of a client"
+        );
+        Ok(())
+    }
+
+    /// Counts the warnings of noq-proto. `logs_contain` sees only the lines that carry the span
+    /// of the test, and the timers of noq run outside of it.
+    #[derive(Debug, Clone, Default)]
+    struct NoqWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl NoqWarnings {
+        /// Counts the warnings of noq-proto on this thread until the guard is dropped.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn count(&self) -> usize {
+            self.0.lock().expect("lock").len()
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().expect("lock").clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NoqWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() == tracing::Level::WARN && meta.target().starts_with("noq_proto") {
+                let mut text = String::new();
+                event.record(
+                    &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                        text.push_str(&format!("{}={value:?} ", field.name()));
+                    },
+                );
+                self.0.lock().expect("lock").push(text);
+            }
+        }
+    }
+
+    // The per-path idle timeout closes an idle path. A connection with one path cannot close
+    // it: noq refuses with `LastOpenPath` and logs a warning, and the connection idle timeout
+    // ends the connection anyway. The path idle timeout must apply only when the connection has
+    // more than one open path.
+    #[tokio::test]
+    async fn the_last_path_of_a_connection_gets_no_idle_timeout() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let local = |builder: super::Builder| {
+            builder
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .expect("valid address")
+        };
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = local(Endpoint::builder(presets::Minimal).alpns(vec![TEST_ALPN.to_vec()]))
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        let client = local(Endpoint::builder(presets::Minimal))
+            .transport_config(short_idle)
+            .bind()
+            .await?;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), TEST_ALPN).await?;
+        assert_eq!(
+            conn.paths().iter().count(),
+            1,
+            "the connection has one path"
+        );
+
+        time::sleep(Duration::from_secs(4)).await;
+
+        assert_eq!(
+            warnings.count(),
+            0,
+            "noq tried to close the last path of the connection for being idle: {:?}",
+            warnings.messages()
+        );
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    // A dial of an id tries every address that the endpoint knows for it. A listener of another
+    // identity on one of them, or one that serves another ALPN, answers the dial first and fails
+    // it as a whole. An address that the caller took out is not tried any more.
+    #[tokio::test]
+    async fn a_dial_does_not_try_an_address_that_was_removed() -> Result {
+        let local = |builder: super::Builder| {
+            builder
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .expect("valid address")
+        };
+        let target = local(Endpoint::builder(presets::Minimal).alpns(vec![TEST_ALPN.to_vec()]))
+            .bind()
+            .await?;
+        let foreign = local(Endpoint::builder(presets::Minimal).alpns(vec![b"other".to_vec()]))
+            .bind()
+            .await?;
+        let client = local(Endpoint::builder(presets::Minimal)).bind().await?;
+        // One task per dial: a dial that the client gave up must not hold back the next one.
+        let serving = tokio::spawn({
+            let target = target.clone();
+            async move {
+                while let Some(incoming) = target.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            conn.closed().await;
+                        }
+                    });
+                }
+            }
+        });
+        let answering = tokio::spawn({
+            let foreign = foreign.clone();
+            async move {
+                while let Some(incoming) = foreign.accept().await {
+                    let _ = incoming.accept();
+                }
+            }
+        });
+        let udp_port = |endpoint: &Endpoint| {
+            endpoint
+                .bound_sockets()
+                .into_iter()
+                .find(|addr| addr.is_ipv4())
+                .expect("an IPv4 socket")
+        };
+        let foreign_addr = udp_port(&foreign);
+        let addr = EndpointAddr::new(target.id())
+            .with_ip_addr(foreign_addr)
+            .with_ip_addr(udp_port(&target));
+
+        // The dials that learn both addresses. Some of them fail, and which ones does not matter.
+        for _ in 0..3 {
+            let _ = time::timeout(
+                Duration::from_secs(3),
+                client.connect(addr.clone(), TEST_ALPN),
+            )
+            .await;
+        }
+        client
+            .remove_endpoint_addr(EndpointAddr::new(target.id()).with_ip_addr(foreign_addr))
+            .await;
+
+        for attempt in 0..6 {
+            let conn = time::timeout(
+                Duration::from_secs(3),
+                client.connect(EndpointAddr::new(target.id()), TEST_ALPN),
+            )
+            .await
+            .std_context("the dial timed out")?
+            .std_context(format!("dial {attempt} after the removal failed"))?;
+            conn.close(0u8.into(), b"");
+        }
+        serving.abort();
+        answering.abort();
+        client.close().await;
+        foreign.close().await;
+        target.close().await;
+        Ok(())
+    }
+
+    // With a second path the idle timeout applies again: the IP path of a connection with a
+    // relay path idles out, because nothing keeps it alive within the short timeout, and the
+    // relay path takes over. The last path stays open, with no warning of noq.
+    #[tokio::test]
+    async fn the_idle_timeout_comes_back_when_a_second_path_opens() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let (relay_map, _relay_url, _relay_guard) = run_relay_server().await?;
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(short_idle)
+            .bind()
+            .await?;
+        client.online().await;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), TEST_ALPN).await?;
+
+        let mut paths = conn.paths_stream();
+        let mut had_two = false;
+        let mut idled_out = false;
+        let watching = time::timeout(Duration::from_secs(8), async {
+            while let Some(infos) = paths.next().await {
+                let has_ip = infos.iter().any(|info| info.is_ip());
+                let has_relay = infos.iter().any(|info| info.is_relay());
+                had_two |= has_ip && has_relay;
+                if had_two && !has_ip && has_relay {
+                    idled_out = true;
+                    break;
+                }
+            }
+        })
+        .await;
+        println!("watch finished in time: {}", watching.is_ok());
+        assert!(
+            had_two,
+            "the connection never had an IP path and a relay path"
+        );
+        assert!(
+            idled_out,
+            "the IP path never idled out beside the relay path"
+        );
+        assert_eq!(warnings.count(), 0, "noq warned about a path");
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    // A server that has the Initial of a client and never gets the rest of the handshake keeps a
+    // connection in the handshake. noq has no multipath yet for it, and it refuses to close a
+    // path for being idle and logs a warning. The path idle timeout must start after the
+    // handshake.
+    #[tokio::test]
+    async fn a_handshake_that_stalls_gets_no_path_idle_timeout() -> Result {
+        let warnings = NoqWarnings::default();
+        let _guard = warnings.install();
+        let short_idle = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .transport_config(short_idle.clone())
+            .bind()
+            .await?;
+        let server_port = server
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4())
+            .expect("an IPv4 socket")
+            .port();
+        let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    tokio::spawn(incoming.into_future());
+                }
+            }
+        });
+
+        // A proxy between the client and the server. It passes the first packet of the client,
+        // the Initial, and drops the others. The replies of the server pass.
+        let client_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let proxy_addr = client_side.local_addr().anyerr()?;
+        let server_side = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?);
+        let client_addr = Arc::new(std::sync::Mutex::new(None));
+        let forward = tokio::spawn({
+            let (client_side, server_side, client_addr) = (
+                client_side.clone(),
+                server_side.clone(),
+                client_addr.clone(),
+            );
+            async move {
+                let mut buf = vec![0u8; 2048];
+                let mut passed = false;
+                while let Ok((len, from)) = client_side.recv_from(&mut buf).await {
+                    *client_addr.lock().expect("lock") = Some(from);
+                    if !passed {
+                        passed = true;
+                        server_side.send_to(&buf[..len], server_addr).await.ok();
+                    }
+                }
+            }
+        });
+        let backward = tokio::spawn({
+            let (client_side, server_side, client_addr) = (
+                client_side.clone(),
+                server_side.clone(),
+                client_addr.clone(),
+            );
+            async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok((len, _)) = server_side.recv_from(&mut buf).await {
+                    let to = *client_addr.lock().expect("lock");
+                    if let Some(to) = to {
+                        client_side.send_to(&buf[..len], to).await.ok();
+                    }
+                }
+            }
+        });
+
+        let client = Endpoint::builder(presets::Minimal).bind().await?;
+        let to_proxy = EndpointAddr::new(server.id()).with_addrs([TransportAddr::Ip(proxy_addr)]);
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(to_proxy, TEST_ALPN).await }
+        });
+
+        time::sleep(Duration::from_secs(4)).await;
+
+        assert_eq!(
+            warnings.count(),
+            0,
+            "noq warned about a path of a connection in the handshake: {:?}",
+            warnings.messages()
+        );
+        dialing.abort();
+        forward.abort();
+        backward.abort();
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// Opens a connection over an IP path and a relay path, with a path idle timeout of 15 s on
+    /// the endpoints and a short one on a single side. Returns whether the IP path idled out
+    /// beside the relay path within 8 s.
+    async fn ip_path_idles_out_with_a_short_timeout_on(side: ShortIdleOn) -> Result<bool> {
+        let (relay_map, _relay_url, _relay_guard) = run_relay_server().await?;
+        let short = super::QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        server.online().await;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        client.online().await;
+        let accepting = tokio::spawn({
+            let server = server.clone();
+            let short = short.clone();
+            async move {
+                let mut kept = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    let accepted = if side == ShortIdleOn::AcceptWith {
+                        let config = server
+                            .create_server_config_builder(vec![TEST_ALPN.to_vec()])
+                            .set_transport_config(short.clone())
+                            .build();
+                        incoming
+                            .accept_with(Arc::new(config))
+                            .expect("accept with a config")
+                            .await
+                    } else {
+                        incoming.await
+                    };
+                    if let Ok(conn) = accepted {
+                        kept.push(conn);
+                    }
+                }
+            }
+        });
+        let conn = if side == ShortIdleOn::ConnectOptions {
+            let opts = super::ConnectOptions::new().with_transport_config(short);
+            client
+                .connect_with_opts(server.addr(), TEST_ALPN, opts)
+                .await?
+                .await?
+        } else {
+            client.connect(server.addr(), TEST_ALPN).await?
+        };
+
+        let mut paths = conn.paths_stream();
+        let mut had_two = false;
+        let mut idled_out = false;
+        time::timeout(Duration::from_secs(8), async {
+            while let Some(infos) = paths.next().await {
+                let has_ip = infos.iter().any(|info| info.is_ip());
+                let has_relay = infos.iter().any(|info| info.is_relay());
+                had_two |= has_ip && has_relay;
+                if had_two && !has_ip && has_relay {
+                    idled_out = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .ok();
+        assert!(
+            had_two,
+            "the connection never had an IP path and a relay path"
+        );
+        conn.close(0u8.into(), b"");
+        accepting.abort();
+        client.close().await;
+        server.close().await;
+        Ok(idled_out)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ShortIdleOn {
+        /// The config of the connection that the client opens.
+        ConnectOptions,
+        /// The config of the connection that the server accepts.
+        AcceptWith,
+    }
+
+    // The path idle timeout of the config of one connection counts, and not the one of the
+    // endpoint. The client has 15 s on its endpoint and 1 s in the options of the connection, and
+    // the server keeps 15 s, so only the client closes the idle IP path.
+    #[tokio::test]
+    async fn the_path_idle_timeout_of_the_connect_options_is_used() -> Result {
+        assert!(
+            ip_path_idles_out_with_a_short_timeout_on(ShortIdleOn::ConnectOptions).await?,
+            "the IP path did not idle out with a short timeout in the connect options"
+        );
+        Ok(())
+    }
+
+    // The same on the server: 1 s in the server config of `accept_with`, 15 s on the client.
+    #[tokio::test]
+    async fn the_path_idle_timeout_of_accept_with_is_used() -> Result {
+        assert!(
+            ip_path_idles_out_with_a_short_timeout_on(ShortIdleOn::AcceptWith).await?,
+            "the IP path did not idle out with a short timeout in the server config"
+        );
         Ok(())
     }
 }

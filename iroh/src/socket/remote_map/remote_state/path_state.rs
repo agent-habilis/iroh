@@ -125,6 +125,11 @@ impl RemotePathState {
         }
     }
 
+    /// Forgets `addr`: it is no address of the remote any more. Returns whether it was known.
+    pub(super) fn remove(&mut self, addr: &transports::Addr) -> bool {
+        self.paths.remove(addr).is_some()
+    }
+
     /// Inserts multiple addresses of unknown status into our list of potential paths.
     ///
     /// If this caused the path set to transition from empty to non-empty, any

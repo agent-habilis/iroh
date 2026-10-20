@@ -280,10 +280,14 @@ impl RemoteMap {
         &mut self,
         remote: EndpointId,
         conn: noq::Connection,
+        path_idle_timeout: std::time::Duration,
         tx: oneshot::Sender<PathStateReceiver>,
     ) {
-        self.send_to_actor(remote, RemoteStateMessage::AddConnection(conn, tx))
-            .await
+        self.send_to_actor(
+            remote,
+            RemoteStateMessage::AddConnection(conn, path_idle_timeout, tx),
+        )
+        .await
     }
 
     /// Sends a message to a `RemoteStateActor`, starting it if not running already.

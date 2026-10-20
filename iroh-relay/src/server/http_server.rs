@@ -1047,8 +1047,6 @@ impl RelayService {
             .map_err(|_elapsed| e!(ServeConnectionError::EstablishTimeout))
             .flatten();
 
-        metrics.http_connections_closed.inc();
-
         if let Err(error) = res {
             match error {
                 ServeConnectionError::ManualAccept { source, .. }
@@ -1059,7 +1057,8 @@ impl RelayService {
                 }
                 // From hyper: <https://github.com/hyperium/hyper/commit/271bba16672ff54a44e043c5cc1ae6b9345bb172>
                 // `hyper::Error::IncompleteMessage` is hyper's equivalent of UnexpectedEof
-                ServeConnectionError::Https { source, .. }
+                ServeConnectionError::ServeConnection { source, .. }
+                | ServeConnectionError::Https { source, .. }
                 | ServeConnectionError::Http { source, .. }
                     if source.is_incomplete_message() =>
                 {
@@ -1071,6 +1070,9 @@ impl RelayService {
                 }
             }
         }
+
+        // Counted last, so that the count says that the end of the connection is logged.
+        metrics.http_connections_closed.inc();
     }
 }
 
@@ -1345,6 +1347,46 @@ mod tests {
                 None
             }
         }
+    }
+
+    // A client that drops the TCP connection in the middle of its request is not a fault of the
+    // server. hyper calls that an incomplete message, and the server logs it at debug.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_client_that_drops_the_connection_mid_request_is_not_an_error() -> Result {
+        let metrics = Arc::new(Metrics::default());
+        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+            .metrics(metrics.clone())
+            .spawn()
+            .await?;
+        let mut stream = tokio::net::TcpStream::connect(server.addr())
+            .await
+            .anyerr()?;
+        stream
+            .write_all(format!("GET {RELAY_PATH} HTTP/1.1\r\nHost: relay\r\n").as_bytes())
+            .await
+            .anyerr()?;
+        drop(stream);
+        // The server counts the connection as closed once it has logged how it ended.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.http_connections_closed.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("the server did not see the end of the connection")?;
+
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains(" ERROR ") && line.contains("failed to handle connection")
+            }) {
+                Err("the server logged an error for a client that dropped its request".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        server.shutdown();
+        Ok(())
     }
 
     #[tokio::test]

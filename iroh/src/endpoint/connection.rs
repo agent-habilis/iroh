@@ -145,9 +145,10 @@ impl Incoming {
     /// Thus it is common to simply log the errors here and accept them as something which
     /// can happen.
     pub fn accept(self) -> Result<Accepting, ConnectionError> {
-        self.inner
-            .accept()
-            .map(|conn| Accepting::new(conn, self.ep))
+        self.inner.accept().map(|conn| {
+            let path_idle_timeout = self.ep.path_idle_timeout();
+            Accepting::new(conn, self.ep, path_idle_timeout)
+        })
     }
 
     /// Accepts this incoming connection using a custom configuration.
@@ -167,7 +168,7 @@ impl Incoming {
     ) -> Result<Accepting, ConnectionError> {
         self.inner
             .accept_with(server_config.to_inner_arc())
-            .map(|conn| Accepting::new(conn, self.ep))
+            .map(|conn| Accepting::new(conn, self.ep, server_config.path_idle_timeout()))
     }
 
     /// Rejects this incoming connection attempt.
@@ -230,7 +231,7 @@ impl IntoFuture for Incoming {
     fn into_future(self) -> Self::IntoFuture {
         IncomingFuture(Box::pin(async move {
             let noq_conn = self.inner.into_future().await?;
-            let conn = conn_from_noq_conn(noq_conn, &self.ep)?.await?;
+            let conn = conn_from_noq_conn(noq_conn, &self.ep, self.ep.path_idle_timeout())?.await?;
             Ok(conn)
         }))
     }
@@ -311,6 +312,7 @@ pub enum AuthenticationError {
 fn conn_from_noq_conn(
     conn: noq::Connection,
     ep: &Endpoint,
+    path_idle_timeout: Duration,
 ) -> Result<
     impl Future<Output = Result<Connection, ConnectingError>> + Send + 'static,
     ConnectingError,
@@ -338,7 +340,9 @@ fn conn_from_noq_conn(
     );
 
     // Register this connection with the socket.
-    let fut = ep.inner.register_connection(info.endpoint_id, conn.clone());
+    let fut = ep
+        .inner
+        .register_connection(info.endpoint_id, conn.clone(), path_idle_timeout);
 
     // Check hooks
     let inner = ep.inner.clone();
@@ -419,6 +423,8 @@ pub struct Connecting {
     #[debug("{}", register_with_socket.as_ref().map(|_| "Some(RegisterWithSocketFut)").unwrap_or("None"))]
     register_with_socket: Option<RegisterWithSocketFut>,
     ep: Endpoint,
+    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`](super::QuicTransportConfig).
+    path_idle_timeout: Duration,
     /// `Some(remote_id)` if this is an outgoing connection, `None` if this is an incoming conn
     remote_endpoint_id: EndpointId,
 }
@@ -436,6 +442,8 @@ pub struct Accepting {
     #[debug("{}", register_with_socket.as_ref().map(|_| "Some(RegisterWithSocketFut)").unwrap_or("None"))]
     register_with_socket: Option<RegisterWithSocketFut>,
     ep: Endpoint,
+    /// The idle timeout of the paths of the connection, see [`QuicTransportConfig`](super::QuicTransportConfig).
+    path_idle_timeout: Duration,
 }
 
 #[stack_error(add_meta, derive, from_sources)]
@@ -480,10 +488,12 @@ impl Connecting {
         inner: noq::Connecting,
         ep: Endpoint,
         remote_endpoint_id: EndpointId,
+        path_idle_timeout: Duration,
     ) -> Self {
         Self {
             inner,
             ep,
+            path_idle_timeout,
             remote_endpoint_id,
             register_with_socket: None,
         }
@@ -532,7 +542,8 @@ impl Connecting {
                     let noq_conn = noq_conn.clone();
                     async move {
                         let accepted = zrtt_accepted.await;
-                        let conn = conn_from_noq_conn(noq_conn, &self.ep)?.await?;
+                        let conn =
+                            conn_from_noq_conn(noq_conn, &self.ep, self.path_idle_timeout)?.await?;
                         Ok(match accepted {
                             true => ZeroRttStatus::Accepted(conn),
                             false => ZeroRttStatus::Rejected(conn),
@@ -574,7 +585,7 @@ impl Future for Connecting {
                 return fut.poll_unpin(cx).map_err(Into::into);
             } else {
                 let noq_conn = std::task::ready!(self.inner.poll_unpin(cx)?);
-                let fut = conn_from_noq_conn(noq_conn, &self.ep)?;
+                let fut = conn_from_noq_conn(noq_conn, &self.ep, self.path_idle_timeout)?;
                 self.register_with_socket = Some(Box::pin(fut.err_into()));
             }
         }
@@ -582,10 +593,11 @@ impl Future for Connecting {
 }
 
 impl Accepting {
-    pub(crate) fn new(inner: noq::Connecting, ep: Endpoint) -> Self {
+    pub(crate) fn new(inner: noq::Connecting, ep: Endpoint, path_idle_timeout: Duration) -> Self {
         Self {
             inner,
             ep,
+            path_idle_timeout,
             register_with_socket: None,
         }
     }
@@ -627,7 +639,7 @@ impl Accepting {
             let noq_conn = noq_conn.clone();
             async move {
                 let _ = zrtt_accepted.await;
-                let conn = conn_from_noq_conn(noq_conn, &self.ep)?.await?;
+                let conn = conn_from_noq_conn(noq_conn, &self.ep, self.path_idle_timeout)?.await?;
                 Ok(conn)
             }
         });
@@ -666,7 +678,7 @@ impl Future for Accepting {
                 return fut.poll_unpin(cx).map_err(Into::into);
             } else {
                 let noq_conn = std::task::ready!(self.inner.poll_unpin(cx)?);
-                match conn_from_noq_conn(noq_conn, &self.ep) {
+                match conn_from_noq_conn(noq_conn, &self.ep, self.path_idle_timeout) {
                     Err(err) => return Poll::Ready(Err(err)),
                     Ok(fut) => self.register_with_socket = Some(Box::pin(fut.err_into())),
                 };
@@ -1180,6 +1192,12 @@ impl Connection<HandshakeCompleted> {
     /// Returns the side of the connection (client or server).
     pub fn side(&self) -> Side {
         self.inner.side()
+    }
+
+    /// The noq connection, for the tests of the socket.
+    #[cfg(all(test, with_crypto_provider))]
+    pub(crate) fn noq_connection(&self) -> &noq::Connection {
+        &self.inner
     }
 
     /// Returns a [`WeakConnectionHandle`] for this connection.
