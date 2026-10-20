@@ -1304,6 +1304,20 @@ mod tests {
             "Accepting incoming connection ended with error",
             "a dialer that went silent in the handshake"
         );
+        // The timeout of the handshake is the path under test. Without this line the test would
+        // pass when the handshake ends in another way, or not at all.
+        logs_assert(|lines: &[&str]| {
+            let timed_out = lines.iter().any(|line| {
+                line.contains(" DEBUG ")
+                    && line.contains("Accepting incoming connection ended with error")
+                    && line.contains("timed out")
+            });
+            if timed_out {
+                Ok(())
+            } else {
+                Err("the router did not log the timeout of the handshake at debug".to_string())
+            }
+        });
         dialing.abort();
         proxy.iter().for_each(|task| task.abort());
         client.close().await;
