@@ -644,9 +644,11 @@ macro_rules! log_unless_orderly {
 /// them. All other errors need a warning, because they point to a fault or a misconfiguration:
 /// for example a bad certificate, an ALPN that the dialer and this endpoint do not agree on, or a
 /// failure of this endpoint. A close that the remote sends with a transport error code is a
-/// report of a fault of this endpoint, so it stays a warning. A TLS alert from the remote is not:
-/// the remote chose not to trust this endpoint, as a probe of another mesh on a shared port does,
-/// and this endpoint cannot act on that choice.
+/// report of a fault of this endpoint, so it stays a warning. Two TLS alerts from the remote are
+/// not: `bad_certificate` and `unknown_ca` say that the remote chose not to trust this endpoint,
+/// as a probe of another mesh on a shared port does, and this endpoint cannot act on that choice.
+/// The other alerts can report a fault of this endpoint, such as a handshake signature that the
+/// remote cannot verify, so they stay a warning.
 fn is_orderly_end(err: &ConnectionError) -> bool {
     match err {
         ConnectionError::TimedOut
@@ -657,15 +659,17 @@ fn is_orderly_end(err: &ConnectionError) -> bool {
         ConnectionError::ConnectionClosed(close) => {
             close.error_code == TransportErrorCode::NO_ERROR
                 || close.error_code == TransportErrorCode::APPLICATION_ERROR
-                || is_tls_alert(close.error_code)
+                || is_untrusted_endpoint_alert(close.error_code)
         }
         _ => false,
     }
 }
 
-/// Whether a transport error code carries a TLS alert, see RFC 9001 section 4.8.
-fn is_tls_alert(code: TransportErrorCode) -> bool {
-    (0x100..=0x1ff).contains(&u64::from(code))
+/// Whether a transport error code carries the TLS alert of a remote that does not trust the
+/// certificate of this endpoint: `bad_certificate` (42, a different endpoint id) or `unknown_ca`
+/// (48, an issuer that the remote does not know). See RFC 9001 section 4.8.
+fn is_untrusted_endpoint_alert(code: TransportErrorCode) -> bool {
+    code == TransportErrorCode::crypto(42) || code == TransportErrorCode::crypto(48)
 }
 
 /// Like [`is_orderly_end`], for the errors of the handshake that wrap a [`ConnectionError`].
@@ -1525,6 +1529,14 @@ mod tests {
             // the remote reports a fault of this endpoint
             closed_by_the_remote(TransportErrorCode::PROTOCOL_VIOLATION),
             closed_by_the_remote(TransportErrorCode::FLOW_CONTROL_ERROR),
+            // the remote reports a TLS alert that is not a choice not to trust us: a version
+            // skew (handshake_failure), a malformed handshake (illegal_parameter), a handshake
+            // signature that it cannot verify (decrypt_error) and a fault of the remote
+            // (internal_error)
+            closed_by_the_remote(TransportErrorCode::crypto(40)),
+            closed_by_the_remote(TransportErrorCode::crypto(47)),
+            closed_by_the_remote(TransportErrorCode::crypto(51)),
+            closed_by_the_remote(TransportErrorCode::crypto(80)),
         ] {
             assert!(
                 !is_orderly_end(&unexpected),
