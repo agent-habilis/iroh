@@ -705,6 +705,13 @@ fn is_endpoint_closed_end(err: &AcceptError, endpoint: &Endpoint) -> bool {
             ..
         }
         | AcceptError::Connection { source, .. } => is_own_close(source, endpoint),
+        // The remote state of the endpoint stops only while the endpoint closes (see the doc of
+        // `conn_from_noq_conn`), so a handshake that meets the stop is a handshake that the close
+        // ended. Outside a close it points to a fault, and it stays a warning.
+        AcceptError::Connecting {
+            source: ConnectingError::InternalConsistencyError { .. },
+            ..
+        } => n0_future::future::now_or_never(endpoint.closed()).is_some(),
         _ => false,
     }
 }
@@ -1322,6 +1329,33 @@ mod tests {
         proxy.iter().for_each(|task| task.abort());
         client.close().await;
         router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // A handshake that meets the stop of the remote state of the endpoint ends with an internal
+    // consistency error. The stop happens only while the endpoint closes, so the router must not
+    // warn about it then. While the endpoint is open the same error is a fault, and it stays a
+    // warning.
+    #[tokio::test]
+    async fn the_stop_of_the_remote_state_is_orderly_only_while_the_endpoint_closes() -> Result {
+        use crate::socket::RemoteStateActorStoppedError;
+
+        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let stopped = || -> AcceptError {
+            e!(ConnectingError::InternalConsistencyError {
+                source: RemoteStateActorStoppedError::new()
+            })
+            .into()
+        };
+        assert!(
+            !is_endpoint_closed_end(&stopped(), &endpoint),
+            "an open endpoint: the stop is a fault"
+        );
+        endpoint.close().await;
+        assert!(
+            is_endpoint_closed_end(&stopped(), &endpoint),
+            "a closing endpoint: the stop is the close"
+        );
         Ok(())
     }
 
