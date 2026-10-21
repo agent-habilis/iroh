@@ -1359,6 +1359,133 @@ mod tests {
         Ok(())
     }
 
+    // The handler of these tests holds a handshake in `on_accepting` until the test lets it go,
+    // and then fails it with the stop of the remote state of the endpoint.
+    #[derive(Debug, Clone, Default)]
+    struct StopsTheRemoteState {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ProtocolHandler for StopsTheRemoteState {
+        async fn on_accepting(
+            &self,
+            _accepting: crate::endpoint::Accepting,
+        ) -> Result<Connection, AcceptError> {
+            use crate::{endpoint::ConnectingError, socket::RemoteStateActorStoppedError};
+
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(e!(ConnectingError::InternalConsistencyError {
+                source: RemoteStateActorStoppedError::new()
+            })
+            .into())
+        }
+
+        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+            Ok(())
+        }
+
+        // The router cancels the open handshakes when the shutdown ends. A slow shutdown leaves
+        // the failing handshake the time to log.
+        async fn shutdown(&self) {
+            n0_future::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // The router logs the stop of the remote state at warn while the endpoint is open, where it
+    // would point to a fault.
+    #[tokio::test]
+    #[traced_test]
+    async fn the_router_warns_about_the_stop_of_the_remote_state_while_the_endpoint_is_open()
+    -> Result {
+        let handler = StopsTheRemoteState::default();
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, handler.clone())
+            .spawn();
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let addr = iroh_base::EndpointAddr::new(server.id())
+            .with_addrs([iroh_base::TransportAddr::Ip(ipv4_addr(&server))]);
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(addr, ECHO_ALPN).await }
+        });
+        handler.entered.notified().await;
+        handler.release.notify_one();
+        n0_future::time::sleep(Duration::from_millis(300)).await;
+
+        logs_assert(|lines: &[&str]| {
+            let warned = lines.iter().any(|line| {
+                line.contains(" WARN ")
+                    && line.contains(
+                        "Accepting incoming connection ended with error: internal consistency error",
+                    )
+            });
+            if warned {
+                Ok(())
+            } else {
+                Err("the router did not warn about the stop of the remote state".to_string())
+            }
+        });
+        dialing.abort();
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    // The same stop, after the close of the endpoint has started, is the close ending the
+    // handshake. The router logs it at debug.
+    #[tokio::test]
+    #[traced_test]
+    async fn the_router_logs_the_stop_of_the_remote_state_at_debug_after_the_endpoint_closes()
+    -> Result {
+        let handler = StopsTheRemoteState::default();
+        let server = Endpoint::bind(presets::Minimal).await?;
+        let router = Router::builder(server.clone())
+            .accept(ECHO_ALPN, handler.clone())
+            .spawn();
+        let client = Endpoint::bind(presets::Minimal).await?;
+        let addr = iroh_base::EndpointAddr::new(server.id())
+            .with_addrs([iroh_base::TransportAddr::Ip(ipv4_addr(&server))]);
+        let dialing = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(addr, ECHO_ALPN).await }
+        });
+        handler.entered.notified().await;
+        let closing = tokio::spawn({
+            let server = server.clone();
+            async move { server.close().await }
+        });
+        server.closed().await;
+        handler.release.notify_one();
+        n0_future::time::sleep(Duration::from_millis(200)).await;
+
+        assert_no_warning!(
+            "Accepting incoming connection ended with error",
+            "the stop of the remote state after the close of the endpoint"
+        );
+        // Without this line the test would pass when the handler never failed the handshake.
+        logs_assert(|lines: &[&str]| {
+            let debugged = lines.iter().any(|line| {
+                line.contains(" DEBUG ")
+                    && line.contains(
+                        "Accepting incoming connection ended with error: internal consistency error",
+                    )
+            });
+            if debugged {
+                Ok(())
+            } else {
+                Err("the router did not log the stop of the remote state at debug".to_string())
+            }
+        });
+        dialing.abort();
+        closing.await.anyerr()?;
+        client.close().await;
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
     // The app can close the endpoint of a router. A handshake that is still open then ends with
     // `LocallyClosed`, a moment before the router cancels it. The endpoint was closed on purpose,
     // so the router must not warn about it. A handler that is slow to shut down makes that moment
