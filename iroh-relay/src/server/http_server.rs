@@ -91,6 +91,20 @@ fn body_full(content: impl Into<hyper::body::Bytes>) -> BytesBody {
     Box::new(http_body_util::Full::new(content.into()))
 }
 
+/// Whether hyper failed to shut a connection down because the client had already reset it.
+///
+/// hyper treats a reset that it reads on an idle connection as the end of the connection, and
+/// then shuts its own side down. On Linux that shutdown gives `NotConnected`, which tokio turns
+/// into success (tokio-rs/tokio#4665). On Windows it gives `ConnectionReset` (WSAECONNRESET),
+/// which reaches the server as an error. A client that cancels a request before it reads the
+/// response, such as an aborted HTTPS probe of net report, can reset the connection this way.
+fn is_reset_on_shutdown(error: &hyper::Error) -> bool {
+    error.is_shutdown()
+        && std::error::Error::source(error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(|source| source.kind() == std::io::ErrorKind::ConnectionReset)
+}
+
 #[allow(clippy::result_large_err)]
 fn downcast_upgrade(upgraded: Upgraded) -> Result<(MaybeTlsStream, Bytes), ConnectionHandlerError> {
     match upgraded.downcast::<hyper_util::rt::TokioIo<MaybeTlsStream>>() {
@@ -1056,11 +1070,12 @@ impl RelayService {
                     debug!(reason=?source, "peer disconnected");
                 }
                 // From hyper: <https://github.com/hyperium/hyper/commit/271bba16672ff54a44e043c5cc1ae6b9345bb172>
-                // `hyper::Error::IncompleteMessage` is hyper's equivalent of UnexpectedEof
+                // `hyper::Error::IncompleteMessage` is hyper's equivalent of UnexpectedEof.
+                // A reset on shutdown is the same end on Windows: see `is_reset_on_shutdown`.
                 ServeConnectionError::ServeConnection { source, .. }
                 | ServeConnectionError::Https { source, .. }
                 | ServeConnectionError::Http { source, .. }
-                    if source.is_incomplete_message() =>
+                    if source.is_incomplete_message() || is_reset_on_shutdown(&source) =>
                 {
                     debug!(reason=?source, "peer disconnected");
                 }
@@ -1387,6 +1402,101 @@ mod tests {
         });
         server.shutdown();
         Ok(())
+    }
+
+    /// A stream whose shutdown fails with `kind`, as the shutdown of a socket that the client
+    /// reset fails on Windows. Reads and writes go to the inner stream.
+    struct FailingShutdown {
+        inner: tokio::io::DuplexStream,
+        kind: std::io::ErrorKind,
+    }
+
+    impl tokio::io::AsyncRead for FailingShutdown {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingShutdown {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.kind)))
+        }
+    }
+
+    /// Serve one request over a stream whose shutdown fails with `kind`, after the client has read
+    /// the response and gone, and give the error that hyper returns. The failure of the shutdown
+    /// is faked, so whether the client read the response does not matter.
+    async fn shutdown_error(kind: std::io::ErrorKind) -> hyper::Error {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let service = hyper::service::service_fn(|_request| async {
+            Ok::<_, Infallible>(Response::new(http_body_util::Empty::<Bytes>::new()))
+        });
+        let connection = hyper::server::conn::http1::Builder::new().serve_connection(
+            hyper_util::rt::TokioIo::new(FailingShutdown {
+                inner: server,
+                kind,
+            }),
+            service,
+        );
+        let client = async move {
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: relay\r\n\r\n")
+                .await
+                .expect("the request");
+            let mut response = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = client.read(&mut buf).await.expect("the response");
+                assert!(read > 0, "the server closed before its response");
+                response.extend_from_slice(&buf[..read]);
+            }
+            // The client goes away: the server reads the end and shuts its side down.
+            drop(client);
+        };
+        let (served, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connection, client)
+        })
+        .await
+        .expect("the server ends the connection after the client went away");
+        served.expect_err("the shutdown of the stream fails")
+    }
+
+    // A shutdown that fails because the client reset the connection is a client that went away,
+    // and any other failure of a shutdown is not. On Windows the shutdown of a socket that the
+    // client reset gives `ConnectionReset`; a real reset reaches that shutdown only in a narrow
+    // window, which a test cannot hit on demand, so the stream fakes the failure and the test
+    // runs on every OS.
+    #[tokio::test]
+    async fn a_reset_on_shutdown_is_a_client_that_went_away() {
+        let reset = shutdown_error(std::io::ErrorKind::ConnectionReset).await;
+        assert!(reset.is_shutdown(), "{reset}");
+        assert!(is_reset_on_shutdown(&reset), "{reset}");
+
+        let other = shutdown_error(std::io::ErrorKind::PermissionDenied).await;
+        assert!(other.is_shutdown(), "{other}");
+        assert!(!is_reset_on_shutdown(&other), "{other}");
     }
 
     #[tokio::test]
