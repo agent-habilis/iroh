@@ -269,32 +269,47 @@ pub enum RunError {
 }
 
 /// Whether the error says that the client went away: its connection reset, broke, or ended in the
-/// middle of a frame. The client chose to leave or died, and the relay can do nothing about it, so
-/// the exit of its actor is not a fault of the relay. Every other error stays a warning.
-fn client_went_away(error: &RunError) -> bool {
+/// middle of a frame or a handshake. The client chose to leave or died, and the relay can do
+/// nothing about it, so the end of its connection is not a fault of the relay. Every other error
+/// stays a warning.
+pub(super) fn client_went_away(error: &impl n0_error::StackError) -> bool {
     use std::io::ErrorKind;
 
-    use n0_error::StackError as _;
+    use n0_error::{AnyError, StackError as _};
+
+    use crate::protos::handshake;
+
+    let io_went_away = |io: &std::io::Error| {
+        matches!(
+            io.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+        )
+    };
 
     error.stack().any(|source| {
         // The io error of the socket sits inside an `AnyError`, which a plain downcast of the
         // chain does not open.
-        source
-            .downcast_ref::<std::io::Error>()
-            .or_else(|| {
-                source
-                    .downcast_ref::<n0_error::AnyError>()
-                    .and_then(|any| any.downcast_ref::<std::io::Error>())
-            })
-            .is_some_and(|io| {
-                matches!(
-                    io.kind(),
-                    ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::BrokenPipe
-                        | ErrorKind::UnexpectedEof
-                )
-            })
+        let io = source.downcast_ref::<std::io::Error>().or_else(|| {
+            source
+                .downcast_ref::<AnyError>()
+                .and_then(|any| any.downcast_ref::<std::io::Error>())
+        });
+        if let Some(io) = io {
+            return io_went_away(io);
+        }
+        if let Some(ws) = source
+            .downcast_ref::<AnyError>()
+            .and_then(|any| any.downcast_ref::<tokio_websockets::Error>())
+        {
+            return matches!(ws, tokio_websockets::Error::Io(io) if io_went_away(io));
+        }
+        matches!(
+            source.downcast_ref::<handshake::Error>(),
+            Some(handshake::Error::UnexpectedEnd { .. })
+        )
     })
 }
 
