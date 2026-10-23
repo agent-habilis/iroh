@@ -32,8 +32,8 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use super::{
-    AllowAll, ClientRequest, DynAccessControl, SpawnError, clients::Clients,
-    streams::InvalidBucketConfig,
+    AllowAll, ClientRequest, DynAccessControl, SpawnError, client::client_went_away,
+    clients::Clients, streams::InvalidBucketConfig,
 };
 use crate::{
     KeyCache,
@@ -640,7 +640,11 @@ impl RelayServiceWithNotify {
                             .relay_connection_handler(upgraded, parts, protocol_version)
                             .await
                         {
-                            warn!("error accepting upgraded connection: {err:#}",);
+                            if client_went_away(&err) {
+                                debug!("client went away during the handshake: {err:#}");
+                            } else {
+                                warn!("error accepting upgraded connection: {err:#}",);
+                            }
                         } else {
                             // We have passed the connection to the relay protocol handler,
                             // thus we trigger the on_establish notification so that timeouts
@@ -1892,6 +1896,100 @@ mod tests {
                 Ok(())
             } else {
                 Err("a canceled upgrade was not logged as a debug line".to_string())
+            }
+        });
+        Ok(())
+    }
+
+    /// Reads the upgrade response of a relay connection up to its blank line.
+    async fn read_upgrade_response(peer: &mut tokio::io::DuplexStream) -> Result<String> {
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(peer.read_u8().await.anyerr()?);
+        }
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    }
+
+    /// The upgrade request of a relay client, as the tests send it.
+    const UPGRADE_REQUEST: &str = "GET /relay HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\n\
+         Connection: upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: iroh-relay-v2\r\n\r\n";
+
+    /// A client that leaves while the relay answers its handshake is not a warning. The relay
+    /// cannot do anything about a client that went away.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_client_that_leaves_during_the_handshake_is_not_a_warning() -> Result {
+        let service = RelayService::new(
+            Handlers::default(),
+            HeaderMap::new(),
+            None,
+            KeyCache::new(16),
+            Arc::new(AllowAll),
+            Arc::new(Metrics::default()),
+        );
+        let service = RelayServiceWithNotify::new(service, Arc::new(tokio::sync::Notify::new()));
+        let (mut peer, server_io) = tokio::io::duplex(64 * 1024);
+        let serve = tokio::spawn(service.serve_connection(MaybeTlsStream::Test(server_io)));
+        peer.write_all(UPGRADE_REQUEST.as_bytes()).await.anyerr()?;
+        let response = read_upgrade_response(&mut peer).await?;
+        assert!(response.starts_with("HTTP/1.1 101"), "got: {response}");
+        // The peer leaves before the relay finishes the handshake.
+        drop(peer);
+        let _ = serve.await;
+        // Paused time: this returns once the handler has nothing else to run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains(" WARN ") && line.contains("error accepting upgraded connection")
+            }) {
+                Err("a client that left the handshake was logged as a warning".to_string())
+            } else if lines
+                .iter()
+                .any(|line| line.contains(" DEBUG ") && line.contains("client went away"))
+            {
+                Ok(())
+            } else {
+                Err("a client that left the handshake was not logged as a debug line".to_string())
+            }
+        });
+        Ok(())
+    }
+
+    /// A protocol violation after the upgrade is still a warning. It is the control of the test
+    /// above: only a client that went away is quieter.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_protocol_violation_after_the_upgrade_stays_a_warning() -> Result {
+        let service = RelayService::new(
+            Handlers::default(),
+            HeaderMap::new(),
+            None,
+            KeyCache::new(16),
+            Arc::new(AllowAll),
+            Arc::new(Metrics::default()),
+        );
+        let service = RelayServiceWithNotify::new(service, Arc::new(tokio::sync::Notify::new()));
+        let (mut peer, server_io) = tokio::io::duplex(64 * 1024);
+        let serve = tokio::spawn(service.serve_connection(MaybeTlsStream::Test(server_io)));
+        peer.write_all(UPGRADE_REQUEST.as_bytes()).await.anyerr()?;
+        let response = read_upgrade_response(&mut peer).await?;
+        assert!(response.starts_with("HTTP/1.1 101"), "got: {response}");
+        // A masked binary frame with the challenge tag (0): the relay waits for the auth tag (1).
+        peer.write_all(&[0x82, 0x81, 0, 0, 0, 0, 0x00])
+            .await
+            .anyerr()?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        serve.abort();
+
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains(" WARN ") && line.contains("error accepting upgraded connection")
+            }) {
+                Ok(())
+            } else {
+                Err("a protocol violation was not logged as a warning".to_string())
             }
         });
         Ok(())
