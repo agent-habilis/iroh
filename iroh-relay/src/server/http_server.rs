@@ -649,6 +649,7 @@ impl RelayServiceWithNotify {
                             debug!("upgraded connection completed");
                         };
                     }
+                    Err(err) if err.is_canceled() => debug!("upgrade canceled: {err:#}"),
                     Err(err) => warn!("upgrade error: {err:#}"),
                 }
             }
@@ -1846,6 +1847,53 @@ mod tests {
 
         client.close().await?;
         server.shutdown();
+        Ok(())
+    }
+
+    /// A peer that abandons an upgrade before the 101 response flushes ends it with a
+    /// canceled error. That is a debug line, not a warning: the peer left on purpose.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_canceled_upgrade_is_a_debug_line_not_a_warning() -> Result {
+        let service = RelayService::new(
+            Handlers::default(),
+            HeaderMap::new(),
+            None,
+            KeyCache::new(16),
+            Arc::new(AllowAll),
+            Arc::new(Metrics::default()),
+        );
+        let service = RelayServiceWithNotify::new(service, Arc::new(tokio::sync::Notify::new()));
+        // One byte of buffer: the 101 response cannot flush, because nothing reads the peer end.
+        let (mut peer, server_io) = tokio::io::duplex(1);
+        let serve = tokio::spawn(service.serve_connection(MaybeTlsStream::Test(server_io)));
+        let request = format!(
+            "GET {RELAY_PATH} HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\n\
+             Connection: upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: iroh-relay-v2\r\n\r\n"
+        );
+        peer.write_all(request.as_bytes()).await.anyerr()?;
+        // Paused time: this sleep returns only once the server has nothing else to run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        serve.abort();
+        // The upgrade task ends with the canceled upgrade. Let it run to its end.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        logs_assert(|lines: &[&str]| {
+            if lines
+                .iter()
+                .any(|line| line.contains(" WARN ") && line.contains("upgrade error"))
+            {
+                Err("a canceled upgrade was logged as a warning".to_string())
+            } else if lines
+                .iter()
+                .any(|line| line.contains(" DEBUG ") && line.contains("upgrade canceled"))
+            {
+                Ok(())
+            } else {
+                Err("a canceled upgrade was not logged as a debug line".to_string())
+            }
+        });
         Ok(())
     }
 }
