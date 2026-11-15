@@ -97,34 +97,39 @@ impl ProbePlan {
     /// Creates an initial probe plan
     pub(super) fn initial(relay_map: &RelayMap, protocols: &BTreeSet<Probe>) -> Self {
         let mut plan = Self::default();
-
         for relay in relay_map.relays::<Vec<_>>() {
-            let mut https_probes = ProbeSet::new(Probe::Https);
-
-            for attempt in 0u32..3 {
-                let delay = HTTPS_OFFSET + DEFAULT_INITIAL_RETRANSMIT * attempt;
-                https_probes.push(delay, relay.clone());
-            }
-
-            plan.add_if_enabled(protocols, https_probes);
+            plan.add_if_enabled(protocols, Self::https_probes(relay));
         }
         plan
     }
 
-    /// Creates a follow up probe plan using a previous net_report report in browsers.
+    /// Creates a follow up probe plan using a previous net_report report.
     ///
-    /// This will only schedule HTTPS probes.
+    /// An incremental report measures a relay by QAD only if the last report did, because
+    /// the QAD connection stays open between reports. Each other relay gets the HTTPS
+    /// probes: it has no QAD port, or its QAD failed, and without the HTTPS probes this
+    /// report would have no latency for it.
     pub(super) fn with_last_report(
         relay_map: &RelayMap,
         last_report: &Report,
         protocols: &BTreeSet<Probe>,
     ) -> Self {
-        if last_report.relay_latency.is_empty() {
-            return Self::initial(relay_map, protocols);
+        let mut plan = Self::default();
+        for relay in relay_map.relays::<Vec<_>>() {
+            if !last_report.relay_latency.has_qad(&relay.url) {
+                plan.add_if_enabled(protocols, Self::https_probes(relay));
+            }
         }
+        plan
+    }
 
-        // TODO: is this good?
-        Self::default()
+    fn https_probes(relay: Arc<RelayConfig>) -> ProbeSet {
+        let mut https_probes = ProbeSet::new(Probe::Https);
+        for attempt in 0u32..3 {
+            let delay = HTTPS_OFFSET + DEFAULT_INITIAL_RETRANSMIT * attempt;
+            https_probes.push(delay, relay.clone());
+        }
+        https_probes
     }
 
     /// Returns an iterator over the [`ProbeSet`]s in this plan.
@@ -261,6 +266,73 @@ mod tests {
         // The readable error:
         assert_eq!(plan.to_string(), expected_plan.to_string());
         // Just in case there's a bug in the Display impl:
+        assert_eq!(plan, expected_plan);
+    }
+
+    #[test]
+    fn test_with_last_report_probes_relay_without_qad() {
+        let url: iroh_base::RelayUrl = "https://no-qad.example".parse().unwrap();
+        let relay_map = RelayMap::from(RelayConfig::new(url.clone(), None));
+        let relay = relay_map.relays::<Vec<_>>()[0].clone();
+        let mut last_report = Report::default();
+        last_report
+            .relay_latency
+            .update_relay(url, Duration::from_millis(10), Probe::Https);
+
+        let plan = ProbePlan::with_last_report(&relay_map, &last_report, &default_protocols());
+
+        let expected_plan: ProbePlan = [probeset! {
+            proto: Probe::Https,
+            relay: relay.clone(),
+            delays: [Duration::from_millis(200),
+                     Duration::from_millis(300),
+                     Duration::from_millis(400)],
+        }]
+        .into_iter()
+        .collect();
+        assert_eq!(plan.to_string(), expected_plan.to_string());
+        assert_eq!(plan, expected_plan);
+    }
+
+    #[test]
+    fn test_with_last_report_probes_only_relays_without_qad_latency() {
+        let qad_url: iroh_base::RelayUrl = "https://qad.example".parse().unwrap();
+        let https_url: iroh_base::RelayUrl = "https://https-only.example".parse().unwrap();
+        let relay_map = RelayMap::from_iter([
+            RelayConfig::new(
+                qad_url.clone(),
+                Some(iroh_relay::RelayQuicConfig::default()),
+            ),
+            RelayConfig::new(
+                https_url.clone(),
+                Some(iroh_relay::RelayQuicConfig::default()),
+            ),
+        ]);
+        let https_relay = relay_map
+            .relays::<Vec<_>>()
+            .into_iter()
+            .find(|relay| relay.url == https_url)
+            .unwrap();
+        let mut last_report = Report::default();
+        last_report
+            .relay_latency
+            .update_relay(qad_url, Duration::from_millis(10), Probe::QadIpv4);
+        last_report
+            .relay_latency
+            .update_relay(https_url, Duration::from_millis(10), Probe::Https);
+
+        let plan = ProbePlan::with_last_report(&relay_map, &last_report, &default_protocols());
+
+        let expected_plan: ProbePlan = [probeset! {
+            proto: Probe::Https,
+            relay: https_relay.clone(),
+            delays: [Duration::from_millis(200),
+                     Duration::from_millis(300),
+                     Duration::from_millis(400)],
+        }]
+        .into_iter()
+        .collect();
+        assert_eq!(plan.to_string(), expected_plan.to_string());
         assert_eq!(plan, expected_plan);
     }
 }
