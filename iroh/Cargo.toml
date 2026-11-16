@@ -135,7 +135,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 console_error_panic_hook = "0.1"
 n0-error = { version = "1.0.0", features = ["anyhow"] }
-postcard = { version = "1.1.1", features = ["use-std"] }
+postcard = { version = "1.1.1", default-features = false, features = ["use-std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand_chacha = "0.10"
 chrono = "0.4.43"
