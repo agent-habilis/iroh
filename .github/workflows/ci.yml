@@ -247,9 +247,11 @@ jobs:
     name: Cross Test
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_3) }}
-    # runs-on: [self-hosted, linux, X64]
+    # Runner workaround: on ubuntu-26.04 (the ubuntu-latest image) the i686 container gets ENOSYS
+    # from socketpair, so every tokio runtime with the signal driver panics at start ("failed to
+    # create UnixStream"). Run 43928314692 (ubuntu-26.04) failed. Upstream runs this job on an
+    # ubuntu 24.04 runner. Go back to the pick-runner slot when the cross image runs green on 26.04.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
