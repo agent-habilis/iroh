@@ -24,6 +24,12 @@ ignore = [
   "RUSTSEC-2024-0436", # paste -> netlink-packet-core
   "RUSTSEC-2026-0194", # netwatch -> netdev -> plist -> quick-xml: remove once https://github.com/ebarnard/rust-plist/pull/191 is released
   "RUSTSEC-2026-0195", # netwatch -> netdev -> plist -> quick-xml: remove once https://github.com/ebarnard/rust-plist/pull/191 is released
+  # Unmaintained, with no fixed version and no known vulnerability. Paths: tokio-rustls-acme 0.9.1
+  # (iroh-relay, iroh-dns-server), wmi 0.18.4 (netwatch), and patchbay 0.7.0 (dev only).
+  { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no fixed version, no known vulnerability; via tokio-rustls-acme 0.9.1 (iroh-relay, iroh-dns-server), wmi 0.18.4 (netwatch), patchbay 0.7.0 (dev only)" },
+  # Unmaintained because it wraps chrono, with no fixed version and no known vulnerability.
+  # Path: humantime-serde 1.1.1 and humantime 2.4.0, both in iroh-dns-server.
+  { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained (wraps chrono), no fixed version, no known vulnerability; via humantime-serde 1.1.1 and humantime 2.4.0 (iroh-dns-server)" },
 ]
 
 [sources]
