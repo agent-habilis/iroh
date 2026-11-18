@@ -192,14 +192,25 @@ impl RelayLatencies {
         self.https.iter().map(|(k, v)| (Probe::Https, k, *v))
     }
 
-    #[cfg(not(wasm_browser))]
+    #[cfg(all(test, not(wasm_browser)))]
     pub(super) fn is_empty(&self) -> bool {
         self.https.is_empty() && self.ipv4.is_empty() && self.ipv6.is_empty()
     }
 
-    #[cfg(wasm_browser)]
+    #[cfg(all(test, wasm_browser))]
     pub(super) fn is_empty(&self) -> bool {
         self.https.is_empty()
+    }
+
+    /// Whether a QAD probe measured this relay.
+    #[cfg(not(wasm_browser))]
+    pub(super) fn has_qad(&self, url: &RelayUrl) -> bool {
+        self.ipv4.contains_key(url) || self.ipv6.contains_key(url)
+    }
+
+    #[cfg(wasm_browser)]
+    pub(super) fn has_qad(&self, _url: &RelayUrl) -> bool {
+        false
     }
 
     /// Returns the lowest latency across records.

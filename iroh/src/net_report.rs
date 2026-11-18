@@ -1066,6 +1066,44 @@ mod tests {
         Ok(())
     }
 
+    /// A relay without QAD has only the HTTPS probes as its latency source, so each
+    /// incremental report must measure it again.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn test_preferred_relay_without_qad_in_incremental_reports() -> Result<()> {
+        let server =
+            iroh_relay::server::Server::spawn(iroh_relay::server::testing::server_config())
+                .await
+                .anyerr()?;
+        let relay = RelayConfig::new(server.https_url().expect("should work as relay"), None);
+        let relay_map = RelayMap::from(relay);
+
+        let resolver = DnsResolver::new();
+        let tls_config = CaTlsConfig::insecure_skip_verify()
+            .client_config(default_provider())
+            .expect("infallible");
+        let opts = Options::new(tls_config);
+        let mut client = Client::new(resolver, relay_map, opts, Default::default());
+        let if_state = IfStateDetails::fake();
+
+        // The first report is a full report, the next ones are incremental.
+        for i in 0..3 {
+            let cancel = CancellationToken::new();
+            let r = client
+                .get_report(if_state.clone(), false, cancel.child_token())
+                .await;
+            assert!(
+                r.preferred_relay.is_some(),
+                "report {i} has no preferred relay: {r:?}"
+            );
+            cancel.cancel();
+        }
+
+        drop(client);
+        server.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_add_report_history_set_preferred_relay() -> Result {
         fn relay_url(i: u16) -> RelayUrl {
