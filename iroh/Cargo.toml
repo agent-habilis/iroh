@@ -38,7 +38,7 @@ n0-future = "0.3"
 n0-error = "1.0.0"
 n0-watcher = "1.0.0"
 # FORK: the agent-habilis/net-tools fork (PR agent-habilis/net-tools#1). Its netwatch takes
-# `noq-udp` from the noq fork below, so the whole graph has one copy of it.
+# `noq-udp` from crates.io, like `iroh` below, so the whole graph has one copy of it.
 #
 # netwatch treated RTM_MISS — "a route lookup failed" — as a topology change and
 # rebuilt the whole interface state for each one: `getifaddrs` per address (on
@@ -52,10 +52,12 @@ n0-watcher = "1.0.0"
 # Pinned here rather than left to each consumer's `[patch.crates-io]` because
 # `[patch]` is not inherited across workspaces — every consumer of this fork
 # would have to restate it, and one that forgot would silently get the storm
-# back. Upstream PR: n0-computer/net-tools#203; drop this hunk once it merges.
+# back. Upstream merged the fix as 0ebdce0 (n0-computer/net-tools#215), and crates.io
+# netwatch 0.19.3 has it. But crates.io netwatch adds 4 duplicate crates (base64, netlink-*),
+# so the fork pin stays until those versions align.
 #
 # `portmapper` below must move in lockstep — see the note there.
-netwatch = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "055e406c2fb54840940fc1c04b30af771a571448" }
+netwatch = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "9241a12a8273f092a4cb1a0d28a1244a3c148341" }
 papaya = { version = "0.2.3", default-features = false }
 pin-project = "1"
 portable-atomic = "1"
@@ -70,13 +72,12 @@ portable-atomic = "1"
 #
 # `noq` and `noq-proto` come from one git source and rev, here and in `iroh-relay`, because a
 # crate from crates.io next to the fork puts two copies of the types in one graph. `noq-udp`
-# comes from the same git source and rev: `netwatch` exposes `noq_udp` types and takes them
-# from the fork, so `iroh` must pass the same copy.
+# comes from crates.io: the fork and `netwatch` take it from there too, so the graph has one copy.
 # Pinned here, not in a `[patch]`, because `[patch]` is not inherited across workspaces. Drop
 # this hunk when upstream takes the change.
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "a3597b1f9fd4390b04c4915e8a4ded6c08331b28", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "a3597b1f9fd4390b04c4915e8a4ded6c08331b28", default-features = false }
-noq-udp = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "a3597b1f9fd4390b04c4915e8a4ded6c08331b28", default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "95c4a2edea4d93783b94fe4d83ed1e9e084472ee", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "95c4a2edea4d93783b94fe4d83ed1e9e084472ee", default-features = false }
+noq-udp = { version = "1.5.0", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustc-hash = "2"
@@ -114,8 +115,8 @@ hickory-resolver = { version = "0.26.0", default-features = false }
 # comes from the fork puts *two* netwatch crates in one graph — and their types
 # cross the portmapper/iroh boundary, so it fails to compile rather than merely
 # duplicating. Either both move or neither does.
-portmapper = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "055e406c2fb54840940fc1c04b30af771a571448", optional = true, default-features = false }
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "a3597b1f9fd4390b04c4915e8a4ded6c08331b28", default-features = false, features = ["runtime-tokio", "rustls"] }
+portmapper = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "9241a12a8273f092a4cb1a0d28a1244a3c148341", optional = true, default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "95c4a2edea4d93783b94fe4d83ed1e9e084472ee", default-features = false, features = ["runtime-tokio", "rustls"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",

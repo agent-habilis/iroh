@@ -2986,7 +2986,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "git+https://github.com/agent-habilis/net-tools?rev=055e406c2fb54840940fc1c04b30af771a571448#055e406c2fb54840940fc1c04b30af771a571448"
+source = "git+https://github.com/agent-habilis/net-tools?rev=9241a12a8273f092a4cb1a0d28a1244a3c148341#9241a12a8273f092a4cb1a0d28a1244a3c148341"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3068,7 +3068,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3089,7 +3089,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3118,8 +3118,9 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3594,7 +3595,7 @@ dependencies = [
 [[package]]
 name = "portmapper"
 version = "0.19.1"
-source = "git+https://github.com/agent-habilis/net-tools?rev=055e406c2fb54840940fc1c04b30af771a571448#055e406c2fb54840940fc1c04b30af771a571448"
+source = "git+https://github.com/agent-habilis/net-tools?rev=9241a12a8273f092a4cb1a0d28a1244a3c148341#9241a12a8273f092a4cb1a0d28a1244a3c148341"
 dependencies = [
  "base64",
  "bytes",
