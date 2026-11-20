@@ -1709,8 +1709,6 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash",
 ]
 
@@ -2338,7 +2336,7 @@ dependencies = [
  "iroh-base",
  "iroh-dns",
  "iroh-metrics",
- "lru 0.18.2",
+ "lru 0.19.0",
  "mainline",
  "n0-error",
  "n0-future",
@@ -2427,7 +2425,7 @@ dependencies = [
  "iroh-base",
  "iroh-dns",
  "iroh-metrics",
- "lru 0.18.2",
+ "lru 0.19.0",
  "n0-error",
  "n0-future",
  "n0-tracing-test",
@@ -2683,9 +2681,9 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
 name = "lru"
-version = "0.18.2"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -2988,7 +2986,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "git+https://github.com/agent-habilis/net-tools?rev=e02960255ef2f5b2ba4aa3d4cf195e0b8673f370#e02960255ef2f5b2ba4aa3d4cf195e0b8673f370"
+source = "git+https://github.com/agent-habilis/net-tools?rev=9241a12a8273f092a4cb1a0d28a1244a3c148341#9241a12a8273f092a4cb1a0d28a1244a3c148341"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3070,7 +3068,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=2b2252ce483cd9a5f88296fa7989bc54324a0bdf#2b2252ce483cd9a5f88296fa7989bc54324a0bdf"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3091,7 +3089,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=2b2252ce483cd9a5f88296fa7989bc54324a0bdf#2b2252ce483cd9a5f88296fa7989bc54324a0bdf"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3120,9 +3118,9 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.3.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dc50afea61aff926e150a36c31f06094608848e114a3fe667d76ec233163b1c"
+checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3597,7 +3595,7 @@ dependencies = [
 [[package]]
 name = "portmapper"
 version = "0.19.1"
-source = "git+https://github.com/agent-habilis/net-tools?rev=e02960255ef2f5b2ba4aa3d4cf195e0b8673f370#e02960255ef2f5b2ba4aa3d4cf195e0b8673f370"
+source = "git+https://github.com/agent-habilis/net-tools?rev=9241a12a8273f092a4cb1a0d28a1244a3c148341#9241a12a8273f092a4cb1a0d28a1244a3c148341"
 dependencies = [
  "base64",
  "bytes",

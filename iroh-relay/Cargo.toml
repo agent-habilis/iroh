@@ -36,7 +36,7 @@ hyper-util = "0.1.1"
 iroh-base = { version = "1.0.3", path = "../iroh-base", default-features = false, features = ["key", "relay"] }
 iroh-dns = { version = "1.0.3", path = "../iroh-dns" }
 iroh-metrics = { version = "1.0.1", default-features = false }
-lru = "0.18.0"
+lru = "0.19.0"
 n0-error = "1.0.0"
 n0-future = "0.3"
 num_enum = "0.7"
@@ -46,8 +46,8 @@ postcard = { version = "1", default-features = false, features = [
     "use-std",
     "experimental-derive",
 ] }
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2b2252ce483cd9a5f88296fa7989bc54324a0bdf", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "2b2252ce483cd9a5f88296fa7989bc54324a0bdf", default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "95c4a2edea4d93783b94fe4d83ed1e9e084472ee", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "95c4a2edea4d93783b94fe4d83ed1e9e084472ee", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.33", default-features = false }
