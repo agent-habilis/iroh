@@ -55,7 +55,7 @@ n0-watcher = "1.0.0"
 # back. Upstream PR: n0-computer/net-tools#203; drop this hunk once it merges.
 #
 # `portmapper` below must move in lockstep — see the note there.
-netwatch = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "5eb9b1bfc37e6e20dfe61076f113a42b8970141f" }
+netwatch = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "6862314909c147f49dfac22daf200bb59c1439f6" }
 papaya = { version = "0.2.3", default-features = false }
 pin-project = "1"
 portable-atomic = "1"
@@ -74,9 +74,9 @@ portable-atomic = "1"
 # from the fork, so `iroh` must pass the same copy.
 # Pinned here, not in a `[patch]`, because `[patch]` is not inherited across workspaces. Drop
 # this hunk when upstream takes the change.
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "13fad1646e70daa0a29d23ac9953e8c6a58141f3", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "13fad1646e70daa0a29d23ac9953e8c6a58141f3", default-features = false }
-noq-udp = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "13fad1646e70daa0a29d23ac9953e8c6a58141f3", default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "6c6b21708c4c33a194572ec82e42627c5631ed82", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "6c6b21708c4c33a194572ec82e42627c5631ed82", default-features = false }
+noq-udp = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "6c6b21708c4c33a194572ec82e42627c5631ed82", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustc-hash = "2"
@@ -114,8 +114,8 @@ hickory-resolver = { version = "0.26.0", default-features = false }
 # comes from the fork puts *two* netwatch crates in one graph — and their types
 # cross the portmapper/iroh boundary, so it fails to compile rather than merely
 # duplicating. Either both move or neither does.
-portmapper = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "5eb9b1bfc37e6e20dfe61076f113a42b8970141f", optional = true, default-features = false }
-noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "13fad1646e70daa0a29d23ac9953e8c6a58141f3", default-features = false, features = ["runtime-tokio", "rustls"] }
+portmapper = { version = "0.19.1", git = "https://github.com/agent-habilis/net-tools", rev = "6862314909c147f49dfac22daf200bb59c1439f6", optional = true, default-features = false }
+noq = { version = "1.1.0", git = "https://github.com/agent-habilis/noq", rev = "6c6b21708c4c33a194572ec82e42627c5631ed82", default-features = false, features = ["runtime-tokio", "rustls"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
