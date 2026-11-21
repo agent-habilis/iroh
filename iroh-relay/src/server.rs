@@ -147,7 +147,10 @@ pub struct RelayConfig {
     /// HTML served on `GET /` and `GET /index.html`.
     ///
     /// If `None`, the built-in Iroh Relay page is served.
-    pub root_page: Option<hyper::body::Bytes>,
+    ///
+    /// The server sends `Content-Security-Policy: default-src 'none'` with both the
+    /// built-in page and a custom page. The page cannot load style, script or images.
+    pub root_page: Option<bytes::Bytes>,
 }
 
 impl RelayConfig {
@@ -735,7 +738,7 @@ impl Server {
                     .unwrap_or(DEFAULT_KEY_CACHE_CAPACITY);
                 let root_page = relay_config
                     .root_page
-                    .unwrap_or_else(|| hyper::body::Bytes::from_static(INDEX));
+                    .unwrap_or_else(|| bytes::Bytes::from_static(INDEX));
                 let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
                     .metrics(metrics.server.clone())
                     .headers(headers)
@@ -1022,7 +1025,7 @@ async fn relay_supervisor(
     ret
 }
 
-fn root_handler(page: hyper::body::Bytes) -> http_server::HyperHandler {
+fn root_handler(page: bytes::Bytes) -> http_server::HyperHandler {
     Box::new(move |_r: Request<Incoming>, response: ResponseBuilder| {
         let body: BytesBody = Box::new(Full::from(page.clone()));
         response
@@ -1342,6 +1345,10 @@ mod tests {
             let response = client.get(&url).send().await.unwrap();
             assert_eq!(response.status(), 200);
             assert!(response.headers().contains_key("content-security-policy"));
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/html; charset=utf-8"
+            );
             assert_eq!(response.text().await.unwrap(), "<h1>custom</h1>");
         }
     }
