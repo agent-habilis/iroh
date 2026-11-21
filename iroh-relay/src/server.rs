@@ -144,14 +144,18 @@ pub struct RelayConfig {
     pub key_cache_capacity: Option<usize>,
     /// Access control for incoming connections.
     pub access: Arc<dyn DynAccessControl>,
+    /// HTML served on `GET /` and `GET /index.html`.
+    ///
+    /// If `None`, the built-in Iroh Relay page is served.
+    pub root_page: Option<hyper::body::Bytes>,
 }
 
 impl RelayConfig {
     /// Creates a new [`RelayConfig`] bound to `http_bind_addr` with default settings.
     ///
-    /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset, and
-    /// access defaults to [`AllowAll`]. Adjust any of these by assigning to the
-    /// corresponding fields after construction.
+    /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset,
+    /// access defaults to [`AllowAll`], and the built-in root page is served. Adjust any
+    /// of these by assigning to the corresponding fields after construction.
     pub fn new(http_bind_addr: impl Into<SocketAddr>) -> Self {
         Self {
             http_bind_addr: http_bind_addr.into(),
@@ -159,6 +163,7 @@ impl RelayConfig {
             limits: Limits::default(),
             key_cache_capacity: None,
             access: Arc::new(AllowAll),
+            root_page: None,
         }
     }
 }
@@ -728,13 +733,16 @@ impl Server {
                 let key_cache_capacity = relay_config
                     .key_cache_capacity
                     .unwrap_or(DEFAULT_KEY_CACHE_CAPACITY);
+                let root_page = relay_config
+                    .root_page
+                    .unwrap_or_else(|| hyper::body::Bytes::from_static(INDEX));
                 let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
                     .metrics(metrics.server.clone())
                     .headers(headers)
                     .key_cache_capacity(key_cache_capacity)
                     .access(relay_config.access)
-                    .request_handler(Method::GET, "/", Box::new(root_handler))
-                    .request_handler(Method::GET, "/index.html", Box::new(root_handler))
+                    .request_handler(Method::GET, "/", root_handler(root_page.clone()))
+                    .request_handler(Method::GET, "/index.html", root_handler(root_page))
                     .request_handler(Method::GET, RELAY_PROBE_PATH, Box::new(probe_handler))
                     .request_handler(Method::GET, "/robots.txt", Box::new(robots_handler))
                     .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
@@ -1014,16 +1022,15 @@ async fn relay_supervisor(
     ret
 }
 
-fn root_handler(
-    _r: Request<Incoming>,
-    response: ResponseBuilder,
-) -> HyperResult<Response<BytesBody>> {
-    let body: BytesBody = Box::new(Full::from(INDEX));
-    response
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(body)
-        .map_err(|err| Box::new(err) as HyperError)
+fn root_handler(page: hyper::body::Bytes) -> http_server::HyperHandler {
+    Box::new(move |_r: Request<Incoming>, response: ResponseBuilder| {
+        let body: BytesBody = Box::new(Full::from(page.clone()));
+        response
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(body)
+            .map_err(|err| Box::new(err) as HyperError)
+    })
 }
 
 /// HTTP latency queries
@@ -1312,6 +1319,31 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body = response.text().await.unwrap();
         assert!(body.contains("iroh.computer"));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_root_page_replaces_default() {
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.root_page = Some("<h1>custom</h1>".into());
+        let server = Server::spawn(ServerConfig {
+            relay: Some(relay),
+            quic: None,
+            metrics_addr: None,
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(ring_config())
+            .build()
+            .unwrap();
+        for path in ["/", "/index.html"] {
+            let url = format!("http://{}{path}", server.http_addr().unwrap());
+            let response = client.get(&url).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(response.headers().contains_key("content-security-policy"));
+            assert_eq!(response.text().await.unwrap(), "<h1>custom</h1>");
+        }
     }
 
     #[tokio::test]
